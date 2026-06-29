@@ -12,9 +12,8 @@ requires-python = ">=3.11"
 
 # 必須のパッケージ
 dependencies = [
-    "fastapi>=0.110.0",
-    "pydantic>=2.0.0",
-    "uvicorn>=0.22.0"
+    "mcp>=0.1.0",
+    "pydantic>=2.0.0"
 ]
 
 [project.optional-dependencies]

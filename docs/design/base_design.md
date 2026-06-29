@@ -1,6 +1,6 @@
-# LLMコード解析向け Rust製Grepエンジン — モジュール設計書
+# LLMコード解析向け ネイティブGrepエンジン — モジュール設計書
 
-**バージョン:** 1.0.0
+**バージョン:** 2.0.0
 **ステータス:** ドラフト完成
 **対象読者:** バックエンドエンジニア、MLエンジニア、DevOpsエンジニア
 
@@ -12,9 +12,9 @@
 2. [モジュール構成](#2-モジュール構成)
 3. [システムアーキテクチャ](#3-システムアーキテクチャ)
 4. [LLMコード解析特有の要件](#4-llmコード解析特有の要件)
-5. [LLM向け Function Calling（Tool）定義](#5-llm向け-function-callingtool定義)
-6. [Dockerサンドボックス環境設計](#6-dockerサンドボックス環境設計)
-7. [ホストAPI設計](#7-ホストapi設計)
+5. [MCP Tool定義](#5-mcp-tool定義)
+6. [セキュリティ設計（ネイティブ実行）](#6-セキュリティ設計ネイティブ実行)
+7. [MCPサーバー設計](#7-mcpサーバー設計)
 8. [インターフェース仕様](#8-インターフェース仕様)
 9. [エラーハンドリング & エージェントリカバリ](#9-エラーハンドリング--エージェントリカバリ)
 10. [セキュリティチェックリスト](#10-セキュリティチェックリスト)
@@ -27,71 +27,49 @@
 
 ### 1.1 モジュールの目的
 
-本モジュール（`llm-grep-engine`）は、LLMエージェント（RAGパイプラインおよびコーディングエージェント）が外部ソースコードリポジトリやユーザー提供コードを解析する際に用いる、**高速かつ安全なコード検索ツール**です。
+本モジュール（`ripgrep-mcp-server`）は、LLMエージェント（RAGパイプラインおよび自律コーディングエージェント）が外部ソースコードやユーザーが提供したリポジトリを解析する際に用いる、**高速かつ安全なコード検索MCPサーバー**です。
 
-LLMの Function Calling（Tool Use）として呼び出され、安全に隔離されたDockerサンドボックス内でRust製の高速検索エンジン [ripgrep](https://github.com/BurntSushi/ripgrep) を実行します。
+WSL（Windows Subsystem for Linux）などのハードウェア制限環境におけるコンテナ起動オーバーヘッドを排除し、パフォーマンスと応答速度を極大化するため、Dockerコンテナによる隔離を行わず、ホスト環境にインストールされた [ripgrep](https://github.com/BurntSushi/ripgrep) をネイティブプロセスとして安全に呼び出す設計を採用します。
 
 ### 1.2 設計原則
 
 | 原則 | 内容 |
 |------|------|
-| **安全性優先** | 未検証コードとLLM生成クエリは常に敵対的入力として扱う |
-| **トークン効率** | LLMのコンテキストウィンドウ消費を最小限に抑える |
-| **自律リカバリ** | エラー情報をLLMが理解・修正できる形式で返す |
-| **疎結合** | 本モジュールは単一ディレクトリに完結し、親プロジェクトへの依存を最小化する |
-| **可観測性** | 全実行ログを構造化JSONで記録し、デバッグ・監査を容易にする |
+| **セキュリティ徹底** | プロセスレベルでパストラバーサルとコマンドインジェクションを完全に防御する |
+| **トークン効率** | LLMのコンテキストウィンドウ消費を最小限に抑えるため、出力制限とメタデータを最適化する |
+| **自律リカバリ** | エラーや切り詰め（Truncation）が発生した際、LLM自身が理解して修正行動を取れる形式で返却する |
+| **ネイティブ高速性** | stdio通信とネイティブプロセスの組み合わせにより、ミリ秒単位の超高速な検索応答を実現する |
+| **可観測性** | プロセスのログは標準エラー出力（stderr）を介して出力し、MCPプロトコルの通信（stdout）と完全に分離する |
 
 ---
 
 ## 2. モジュール構成
 
-本モジュールは親プロジェクトへの移行を容易にするため、すべての主要コードを **`llm-grep-engine/`** ディレクトリ配下に集約します。
+移行および配置を容易にするため、すべてのコードを `src/ripgrep_mcp/` ディレクトリ配下に集約します。
 
 ```
-llm-grep-engine/
+ripgrep-mcp-server/
 │
-├── README.md                      # モジュール概要・クイックスタート
-├── DESIGN.md                      # 本設計書（このファイル）
+├── README.md                      # プロジェクト概要・クイックスタート
+├── docs/
+│   └── design/
+│       └── base_design.md         # 本設計書（このファイル）
 │
-├── api/                           # ホストAPI層
-│   ├── __init__.py
-│   ├── server.py                  # FastAPIエントリポイント
-│   ├── routes.py                  # /search エンドポイント定義
-│   ├── schema.py                  # リクエスト/レスポンス Pydanticモデル
-│   └── middleware.py              # 認証・レートリミット
-│
-├── core/                          # コアロジック
-│   ├── __init__.py
-│   ├── sanitizer.py               # 入力パラメータのサニタイズ
-│   ├── command_builder.py         # ripgrepコマンド組み立て
-│   ├── container_runner.py        # Dockerコンテナ実行管理
-│   └── output_parser.py           # ripgrep JSON出力のパース・整形
-│
-├── sandbox/                       # Dockerサンドボックス定義
-│   ├── Dockerfile                 # ripgrepコンテナイメージ
-│   └── entrypoint.sh              # （オプション）ラッパースクリプト
-│
-├── config/                        # 設定ファイル
-│   ├── settings.py                # 環境変数・デフォルト値定義
-│   └── limits.py                  # リソース制限定数
+├── src/
+│   └── ripgrep_mcp/
+│       ├── __init__.py            # パッケージ初期化
+│       ├── server.py              # MCPサーバー（FastMCP）
+│       ├── sanitizer.py           # パストラバーサル・入力値サニタイズ
+│       └── command.py             # ripgrepプロセス実行・結果パース
 │
 ├── tests/                         # テストスイート
-│   ├── unit/
-│   │   ├── test_sanitizer.py
-│   │   ├── test_command_builder.py
-│   │   └── test_output_parser.py
-│   └── integration/
-│       └── test_container_runner.py
+│   ├── __init__.py
+│   └── test_ripgrep_mcp.py        # 各種バリデーター・パーサーのテスト
 │
-├── tool_definition/               # LLM向けTool定義（JSON Schema）
-│   └── search_codebase.json       # OpenAI / Anthropic形式のTool定義
-│
-├── docker-compose.yml             # 開発・テスト用Compose設定
+├── mypy.ini                       # Mypy設定
 ├── pyproject.toml                 # パッケージ定義・依存関係
-└── .env.example                   # 環境変数テンプレート
+└── ruff.toml                      # Ruff設定
 ```
-
-> **移行時の注意:** 親プロジェクトへ組み込む際は `llm-grep-engine/` ディレクトリごとコピーし、`api/server.py` のルーターを親のAPIサーバーにマウントしてください。外部依存は `pyproject.toml` にすべて記載されています。
 
 ---
 
@@ -101,45 +79,40 @@ llm-grep-engine/
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  LLM Agent / RAG Pipeline                                       │
+│  LLM Agent (Claude, Desktop App, etc.)                          │
 │                                                                 │
 │  1. 検索意図の決定                                                │
 │     例: "get_user関数の定義を探したい"                             │
-│         → query: "def get_user", target_dir: "src/", ...       │
+│         → query: "def get_user", target_dir: "src", ...        │
 └────────────────────────┬────────────────────────────────────────┘
-                         │ Function Calling / Tool Use
+                         │ MCP Tool Call (stdio via JSON-RPC)
                          ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  ホストAPI  (llm-grep-engine/api/)                               │
+│  MCP Server  (src/ripgrep_mcp/server.py)                        │
 │                                                                 │
-│  2a. 入力バリデーション & サニタイズ (sanitizer.py)                 │
-│  2b. ripgrepコマンド組み立て (command_builder.py)                  │
-│  2c. 実行タイムアウト監視開始                                      │
+│  2a. 引数バリデーション (SearchParams)                           │
+│  2b. パストラバーサルチェック (sanitizer.py)                       │
+│  2c. コマンドライン引数のリスト組み立て (command.py)              │
 └────────────────────────┬────────────────────────────────────────┘
-                         │ docker run ...
+                         │ subprocess.run(["rg", ...], shell=False)
                          ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  Docker サンドボックス  (llm-grep-engine/sandbox/)               │
+│  ネイティブプロセス実行                                          │
 │                                                                 │
-│  ┌─────────────────┐       ┌──────────────────────────────┐    │
-│  │   ripgrep (rg)  │◄──────│  対象ソースコード               │    │
-│  │  (Alpine Linux) │       │  (Read-Only マウント :ro)     │    │
-│  └────────┬────────┘       └──────────────────────────────┘    │
-│           │ 3. 検索実行                                          │
-│           ▼                                                     │
-│     JSON出力 (JSONL形式) → stdout                               │
-│     [制限] --read-only / --network none / -m 256m / --cpus=1.0 │
+│  - 実行ディレクトリをベースパス配下に厳格制限                      │
+│  - タイムアウト監視 (3.0秒)                                      │
+│  - シェルを経由しない配列引数実行                                  │
 └────────────────────────┬────────────────────────────────────────┘
-                         │ stdout / stderr / exit code
+                         │ stdout (JSONL) / stderr / exit code
                          ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  ホストAPI  後処理                                                │
+│  MCP Server  後処理                                                │
 │                                                                 │
-│  4a. ripgrep JSONLのパース (output_parser.py)                    │
-│  4b. トークン削減フォーマットへの変換                               │
-│  4c. Truncation判定 & メタデータ付与                              │
+│  4a. ripgrep JSONL出力をパース (command.py)                       │
+│  4b. マッチ行およびコンテキストの行番号整理                        │
+│  4c. レスポンス文字数上限（8,000文字）に収まるよう切り詰め         │
 └────────────────────────┬────────────────────────────────────────┘
-                         │ JSON Response
+                         │ MCP Response (Text)
                          ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  LLM Agent                                                      │
@@ -151,59 +124,49 @@ llm-grep-engine/
 
 | コンポーネント | 場所 | 責務 |
 |---|---|---|
-| **ホストAPI** | `api/` | リクエスト受付、サニタイズ、レスポンス整形 |
-| **サニタイザー** | `core/sanitizer.py` | 正規表現・パスのバリデーション、インジェクション防止 |
-| **コマンドビルダー** | `core/command_builder.py` | 安全なripgrepコマンドのリスト形式構築 |
-| **コンテナランナー** | `core/container_runner.py` | Dockerコンテナのライフサイクル管理・タイムアウト監視 |
-| **アウトプットパーサー** | `core/output_parser.py` | ripgrep JSONLのパースとLLM向けフォーマット変換 |
-| **Dockerサンドボックス** | `sandbox/` | ripgrep実行環境の隔離・制限 |
+| **MCPサーバー** | `server.py` | MCPプロトコル制御、`search_codebase` ツールの公開、例外捕捉とレスポンス返却 |
+| **サニタイザー** | `sanitizer.py` | パストラバーサル（`..`）防止、クエリ正規表現のバリデーション |
+| **コマンドビルダー** | `command.py` | 安全な引数リスト構築、`subprocess.run` を用いたタイムアウト付き実行 |
+| **アウトプットパーサー** | `command.py` | ripgrep JSONLのパース、行番号付与、レスポンスサイズ最適化 |
 
 ---
 
 ## 4. LLMコード解析特有の要件
 
-通常のgrep検索ツールとは異なり、LLMエージェントのツールとして動作するため、以下の要件を満たす設計とします。
-
 ### 4.1 コンテキスト行の取得
 
-マッチした1行だけでなく、関数の本体・クラス定義を理解するために**前後N行のコード**を併せて返却します。
+マッチした行単体だけでなく、関数の本体やクラスの定義をLLMが理解できるよう、前後のコンテキスト行を併せて返却します。
 
-- `context_lines` パラメータで調整可能（デフォルト: 3行）
+- `context_lines` パラメータで指定可能（デフォルト: 3行、最大: 20行）
 - ripgrepの `-C <N>` オプションを使用
-- コンテキスト区切り（`--`）を用いて複数マッチの視認性を確保
+- 離れた行の間には区切り文字（` --\n`）を挿入し、構造を認識させやすくする
 
 ### 4.2 トークン数の制御（コンテキストウィンドウ爆発の防止）
 
-`.` などの汎用正規表現で大量ヒットした場合、LLMのコンテキストウィンドウ（通常8K〜200Kトークン）を超過するリスクがあります。
+`.*` などの緩い正規表現により大量の行がヒットした場合、LLMのコンテキストウィンドウを急激に消費するのを防ぎます。
 
-**対策:**
-
-| 制限種別 | 実装 | デフォルト値 | 設定箇所 |
+| 制限種別 | 実装方法 | 設定値 | 目的 |
 |---|---|---|---|
-| 最大マッチ件数 | `rg -m <N>` | 20件 | `config/limits.py` |
-| 最大ファイル数 | ホスト側で件数カウント後に打ち切り | 10ファイル | `config/limits.py` |
-| 最大コンテキスト行数 | パラメータ上限バリデーション | 20行 | `core/sanitizer.py` |
-| レスポンス最大文字数 | 出力パース後にトリミング | 8,000文字 | `core/output_parser.py` |
+| 最大マッチ件数 | `rg -m <N>` | デフォルト20件 / 最大50件 | 検索出力自体のサイズを制限 |
+| レスポンス最大文字数 | パース後の結果切り詰め | 最大 8,000 文字 | トークン消費量を安全な範囲に抑える |
 
-切り捨てが発生した場合、`metadata.truncated: true` をレスポンスに含め、LLMが自律的にクエリを絞り込めるよう誘導します。
+切り詰めが発生した場合は、レスポンスのメタデータに `truncated: true` を明示し、LLMに「クエリを絞り込むべき」というインサイトを提供します。
 
 ### 4.3 ReDoS（正規表現DoS）対策
 
-LLMが生成した複雑な正規表現（例: `(.+)+`, `.*.*.*`）が壊滅的バックトラッキングに陥り、ホストのCPUを占有するリスクがあります。
+LLMが生成した非効率な正規表現（例: `(a+)+`）が最悪時間計算量になり、ホストのCPUを占有し続けるリスクがあります。
 
-**多層防御:**
-
-1. **タイムアウト:** ホスト側で実行を3秒で強制終了（`subprocess.run(timeout=3)`）
-2. **CPUリソース制限:** Dockerの `--cpus="1.0"` でホストへの影響を局所化
-3. **静的バリデーション（将来拡張）:** `regex` ライブラリの複雑度チェックを `sanitizer.py` で実施予定
+**対策:**
+1. **実行タイムアウト:** `subprocess.run` の `timeout=3.0` により、3秒経過した時点でプロセスをシグナルで強制終了（Kill）する。
+2. **巨大ファイル回避:** `--max-filesize 10M` オプションを指定し、ビルド成果物や巨大ログファイルを検索対象外にする。
 
 ---
 
-## 5. LLM向け Function Calling（Tool）定義
+## 5. MCP Tool定義
 
-### 5.1 JSON Schema定義
+### 5.1 スキーマ定義
 
-`tool_definition/search_codebase.json` として配置し、OpenAI API・Anthropic API・その他LLMフレームワークから読み込めます。
+本サーバーが公開するツール `search_codebase` の仕様です。
 
 ```json
 {
@@ -218,7 +181,7 @@ LLMが生成した複雑な正規表現（例: `(.+)+`, `.*.*.*`）が壊滅的�
       },
       "target_dir": {
         "type": "string",
-        "description": "検索対象のディレクトリパス（相対パス）。リポジトリ全体を検索する場合は '.'、特定サービスに絞る場合は 'src/services/' のように指定。"
+        "description": "検索対象のディレクトリパス（相対パス）。リポジトリ全体を検索する場合は '.'"
       },
       "context_lines": {
         "type": "integer",
@@ -230,12 +193,12 @@ LLMが生成した複雑な正規表現（例: `(.+)+`, `.*.*.*`）が壊滅的�
       "file_extensions": {
         "type": "array",
         "items": { "type": "string" },
-        "description": "検索対象ファイルの拡張子リスト（例: ['py', 'ts', 'go']）。絞り込み不要な場合は空配列。",
+        "description": "検索対象ファイルの拡張子リスト（例: ['py', 'ts']）。絞り込み不要な場合は空配列。",
         "default": []
       },
       "max_matches": {
         "type": "integer",
-        "description": "取得するマッチの最大件数。デフォルト20、最大50。大きくするとトークンを多く消費します。",
+        "description": "取得するマッチの最大件数。デフォルト20、最大50。",
         "default": 20,
         "minimum": 1,
         "maximum": 50
@@ -246,275 +209,124 @@ LLMが生成した複雑な正規表現（例: `(.+)+`, `.*.*.*`）が壊滅的�
 }
 ```
 
-### 5.2 LLMへの利用ガイドライン（System Promptへの埋め込み推奨）
+---
 
-以下を親プロジェクトのSystem Promptに追記することで、LLMが本ツールを適切に使用できます。
+## 6. セキュリティ設計（ネイティブ実行）
 
-```
-## search_codebase ツールの使い方
+Dockerによるカーネルレベルの隔離を行わないため、Pythonプロセス内での厳格なバリデーションが必要不可欠です。
 
-- 関数定義を探す場合: query="def function_name" または "function functionName"
-- クラスを探す場合: query="class [A-Z]\w+"
-- 結果が truncated=true の場合: file_extensions や target_dir を絞り込んでリトライ
-- Timeout エラーの場合: 正規表現をシンプルにしてリトライ（例: ".+" → "get_user"）
-- 変数の使用箇所を探す場合: context_lines=2 で十分、関数全体を読む場合は context_lines=10
-```
+### 6.1 パストラバーサル（Directory Traversal）防御
+
+LLMや不正な入力が `target_dir` に `../../../../etc/passwd` や `..\..\..\Windows` などを指定し、ワークスペース外の機密ファイルを窃取する攻撃を防御します。
+
+- **解決プロセス:**
+  1. システムの検索基盤となる `BASE_DIR`（ワークスペースの絶対パス）を環境変数（`RIPGREP_BASE_DIR`、未指定時はカレントディレクトリ）から取得し、`Path.resolve()` で正規化。
+  2. `target_dir` から絶対パスを合成し、`Path.resolve()` でシンボリックリンクや相対表現（`..`）を完全に展開。
+  3. 展開後の絶対パスの親（`Path.parents`）に `BASE_DIR` が含まれていること、あるいは `BASE_DIR == target` であることを検証。一致しない場合は `INVALID_PATH` エラーを返却し、コマンド実行を拒否。
+
+### 6.2 コマンドインジェクション防御
+
+`; rm -rf /` や `& calc.exe` などのOS特有のコマンド結合文字を入力に含め、意図しないコマンドを実行させる攻撃を防ぎます。
+
+- **解決プロセス:**
+  - Pythonの `subprocess.run` を呼び出す際、`shell=False`（デフォルト）を設定。
+  - 引数をすべて配列形式（`list[str]`）で渡し、文字列結合によるシェルパーサーの呼び出しをバイパス。
+  - ripgrepにオプションと誤認識されるのを防ぐため、クエリとパスの前に `--`（引数終端マーカー）を配置。
 
 ---
 
-## 6. Dockerサンドボックス環境設計
+## 7. MCPサーバー設計
 
-### 6.1 Dockerfile
+### 7.1 バリデーションクラス (`sanitizer.py`)
 
-```dockerfile
-# sandbox/Dockerfile
-# ベース: 軽量・セキュアなAlpine Linux
-FROM alpine:3.19
-
-# メタデータ
-LABEL maintainer="your-team"
-LABEL description="Sandboxed ripgrep engine for LLM code analysis"
-LABEL version="1.0.0"
-
-# ripgrepのインストール（バージョン固定推奨）
-RUN apk add --no-cache ripgrep=14.1.0-r0
-
-# セキュリティ: root権限を完全剥奪
-USER nobody
-
-# 作業ディレクトリ
-WORKDIR /workspace
-
-# エントリポイントを固定 — シェルを介さないEXEC形式で任意コマンド実行を防止
-ENTRYPOINT ["rg"]
-```
-
-> **重要:** `CMD` は設定しません。すべての引数はホストAPI側から明示的に渡します。シェルを経由しないことで、引数インジェクションによる任意コマンド実行を防ぎます。
-
-### 6.2 実行時セキュリティ＆リソース制限
-
-```bash
-docker run \
-  --rm \                          # 実行完了後にコンテナを即時破棄
-  --read-only \                   # コンテナ内ファイルシステムを読み取り専用に
-  --network none \                # ネットワークを完全遮断
-  -m 256m \                       # メモリ上限 256MB
-  --memory-swap 256m \            # スワップも同値（スワップ無効化）
-  --cpus="1.0" \                  # CPU使用を1コアに制限
-  --pids-limit 64 \               # プロセス数上限（フォーク爆弾対策）
-  --cap-drop ALL \                # 全Linuxケーパビリティを剥奪
-  --security-opt no-new-privileges \  # 権限昇格を禁止
-  -v "/host/repo:/workspace/src:ro" \ # ソースコードを読み取り専用でマウント
-  llm-grep-engine:1.0.0 \
-  [ripgrepの引数...]
-```
-
-### 6.3 リソース制限の設計根拠
-
-| 制限項目 | 設定値 | 設計根拠 |
-|---|---|---|
-| `--read-only` | — | 解析対象コードの改ざん・ファイル生成を防止 |
-| `--network none` | — | 悪意あるコードへの外部通信・データ漏洩を遮断 |
-| `-m 256m` | 256MB | 巨大バイナリを誤って検索した際のメモリ枯渇防止 |
-| `--cpus="1.0"` | 1コア | ReDoSによるホストCPU全占有を防止 |
-| `--pids-limit 64` | 64プロセス | フォーク爆弾によるホストプロセス枯渇を防止 |
-| `--cap-drop ALL` | 全剥奪 | コンテナエスケープの攻撃面を最小化 |
-| `--rm` | — | コンテナが状態を保持しないことを保証 |
-
-### 6.4 Dockerイメージのビルド
-
-```bash
-# llm-grep-engine/ ディレクトリから実行
-docker build -t llm-grep-engine:1.0.0 ./sandbox/
-```
-
----
-
-## 7. ホストAPI設計
-
-### 7.1 エンドポイント
-
-```
-POST /v1/grep/search
-```
-
-### 7.2 リクエストスキーマ（`api/schema.py`）
+Pydanticを用いて、パラメータの型や範囲制限を宣言的に定義します。
 
 ```python
-from pydantic import BaseModel, Field, validator
-from typing import List, Optional
+from pydantic import BaseModel, Field, field_validator
+from typing import List
 
-class SearchRequest(BaseModel):
-    query: str = Field(..., description="検索クエリ or 正規表現")
-    target_dir: str = Field(..., description="検索対象ディレクトリ（相対パス）")
-    context_lines: int = Field(default=3, ge=0, le=20)
+class SearchParams(BaseModel):
+    query: str = Field(..., min_length=1)
+    target_dir: str = Field(...)
+    context_lines: int = Field(3, ge=0, le=20)
     file_extensions: List[str] = Field(default_factory=list)
-    max_matches: int = Field(default=20, ge=1, le=50)
+    max_matches: int = Field(20, ge=1, le=50)
 
-    @validator("query")
-    def query_not_empty(cls, v):
+    @field_validator("query")
+    @classmethod
+    def query_not_empty(cls, v: str) -> str:
         if not v.strip():
-            raise ValueError("queryは空にできません")
-        return v
-
-    @validator("target_dir")
-    def target_dir_no_traversal(cls, v):
-        # パストラバーサル防止
-        if ".." in v or v.startswith("/"):
-            raise ValueError("無効なtarget_dirです")
+            raise ValueError("query cannot be empty or whitespace only")
         return v
 ```
 
-### 7.3 コマンド組み立て（`core/command_builder.py`）
+### 7.2 コマンド実行 & パース (`command.py`)
 
-コマンドは **リスト形式** で構築します。文字列結合によるシェルインジェクションを排除します。
+シェルを介さない安全なプロセス実行と、JSONL形式の出力をLLM用に行番号付きフォーマットへ変換するロジックを構成します。
 
 ```python
-def build_rg_command(request: SearchRequest) -> list[str]:
-    """
-    ripgrepコマンドをリスト形式で組み立てる。
-    シェルを経由せず subprocess に直接渡すことでインジェクションを防止。
-    """
-    cmd = [
-        "rg",
-        "--json",                           # JSONL形式で出力
-        "-C", str(request.context_lines),   # 前後コンテキスト行
-        "-m", str(request.max_matches),     # 最大マッチ数（ホスト側で強制）
-        "--max-filesize", "10M",            # 巨大ファイルをスキップ
-    ]
-
-    # ファイル拡張子フィルタ
-    for ext in request.file_extensions:
-        cmd.extend(["-t", ext])
-
-    # クエリと対象ディレクトリは "--" の後に配置（オプション誤認識防止）
-    cmd.extend(["--", request.query, f"/workspace/src/{request.target_dir}"])
-
+# build_rg_command の概略
+def build_rg_command(params: SearchParams, target_path: str) -> list[str]:
+    cmd = ["rg", "--json", "-C", str(params.context_lines), "-m", str(params.max_matches), "--max-filesize", "10M"]
+    for ext in params.file_extensions:
+        cmd.extend(["-g", f"*.{ext.lstrip('.')}"])
+    cmd.extend(["--", params.query, target_path])
     return cmd
-```
-
-### 7.4 コンテナ実行（`core/container_runner.py`）
-
-```python
-import subprocess
-import shlex
-from config.limits import EXECUTION_TIMEOUT_SEC
-
-def run_in_sandbox(
-    rg_command: list[str],
-    host_repo_path: str,
-    image: str = "llm-grep-engine:1.0.0"
-) -> tuple[str, str, int]:
-    """
-    Dockerサンドボックス内でripgrepを実行し (stdout, stderr, exit_code) を返す。
-    """
-    docker_cmd = [
-        "docker", "run",
-        "--rm",
-        "--read-only",
-        "--network", "none",
-        "-m", "256m",
-        "--memory-swap", "256m",
-        "--cpus", "1.0",
-        "--pids-limit", "64",
-        "--cap-drop", "ALL",
-        "--security-opt", "no-new-privileges",
-        "-v", f"{host_repo_path}:/workspace/src:ro",
-        image,
-        *rg_command,   # "rg", "--json", ... などripgrepコマンド
-    ]
-
-    try:
-        result = subprocess.run(
-            docker_cmd,
-            capture_output=True,
-            text=True,
-            timeout=EXECUTION_TIMEOUT_SEC,  # デフォルト3秒
-        )
-        return result.stdout, result.stderr, result.returncode
-
-    except subprocess.TimeoutExpired:
-        return "", "TIMEOUT", -1
 ```
 
 ---
 
 ## 8. インターフェース仕様
 
-### 8.1 ripgrepコマンド例
+### 8.1 終了コードの扱い
 
-```bash
-# 例: get_user関数を src/api/ 配下の .py ファイルから検索、前後5行取得、最大20件
-rg --json -C 5 -m 20 -t py -- "def get_user" /workspace/src/api/
-```
-
-### 8.2 ripgrep終了コード
-
-| コード | 意味 | システムの扱い |
+| コード | 意味 | サーバーの処理 |
 |---|---|---|
-| `0` | マッチあり | 正常レスポンス |
-| `1` | マッチなし | 空結果を返す（エラーではない） |
-| `2` | 正規表現・引数エラー | エラーレスポンス（stderrをLLMへ転送） |
-| `-1` | タイムアウト（ホスト側kill） | タイムアウトエラーレスポンス |
+| `0` | マッチあり | 正常にパースして結果を返却 |
+| `1` | マッチなし | エラーではなく、空配列 `results: []` を返却 |
+| `2` / その他 | コマンドエラー / 正規表現エラー | `stderr` の中身を取得し、`REGEX_ERROR` または `INTERNAL_ERROR` として返却 |
+| `-1` | タイムアウト | `TIMEOUT` エラーを返却 |
+| `-2` | `rg` コマンドが存在しない | `RIPGREP_NOT_FOUND` エラーを返却 |
 
-### 8.3 成功レスポンス（`status: success`）
+### 8.2 レスポンス形式
 
+#### 成功時
 ```json
 {
   "status": "success",
   "metadata": {
     "query": "def get_user",
-    "target_dir": "src/",
-    "total_matches_found": 2,
-    "files_searched": 34,
-    "truncated": false,
-    "execution_time_ms": 142
+    "target_dir": "src",
+    "truncated": false
   },
   "results": [
     {
-      "file": "src/api/auth.py",
-      "code_snippet": " 40:     # Validate token\n 41:     if not token:\n 42:         def get_user(token: str):\n 43:             return db.query(User).filter(...)\n 44: "
-    },
-    {
-      "file": "src/services/user.py",
-      "code_snippet": " 13: class UserService:\n 14:     @staticmethod\n 15:     def get_user(user_id: int):\n 16:         pass\n 17: "
+      "file": "src/ripgrep_mcp/server.py",
+      "code_snippet": "  40: \n  41: def get_user(token: str):\n  42:     return db.query(User).filter(...)\n  43: "
     }
   ]
 }
 ```
 
-> `code_snippet` の各行先頭に行番号（` NN:` 形式）を付与します。これにより、LLMが「`src/services/user.py` の15行目を書き換えるパッチを生成して」のような後続指示を正確に実行できます。
-
-### 8.4 Truncatedレスポンス（上限到達時）
-
+#### 切り詰め（Truncated）時
 ```json
 {
   "status": "success",
   "metadata": {
     "query": "def ",
-    "total_matches_found": 20,
-    "truncated": true,
-    "truncation_reason": "max_matches_reached",
-    "suggestion": "file_extensions や target_dir を絞り込んで再検索してください。"
+    "target_dir": ".",
+    "truncated": true
   },
-  "results": [ "..." ]
+  "results": [
+    {
+      "file": "src/ripgrep_mcp/server.py",
+      "code_snippet": "  41: def get_user(token: str):\n..."
+    }
+  ]
 }
 ```
 
-### 8.5 エラーレスポンス
-
-```json
-{
-  "status": "error",
-  "error": {
-    "code": "TIMEOUT",
-    "message": "検索クエリが複雑すぎるか、検索範囲が広すぎます。",
-    "suggestion": "正規表現をシンプルにするか、ディレクトリを絞り込んでください。",
-    "ripgrep_error": null
-  }
-}
-```
-
+#### エラー時 (正規表現エラー)
 ```json
 {
   "status": "error",
@@ -527,171 +339,76 @@ rg --json -C 5 -m 20 -t py -- "def get_user" /workspace/src/api/
 }
 ```
 
-### 8.6 エラーコード一覧
-
-| `error.code` | 原因 | LLMへの推奨アクション |
-|---|---|---|
-| `TIMEOUT` | 実行が3秒を超過 | 正規表現を単純化・対象ディレクトリを絞る |
-| `REGEX_ERROR` | 正規表現構文エラー | `ripgrep_error` を参照し正規表現を修正 |
-| `NO_RESULTS` | マッチなし（Exit 1） | クエリを緩める・対象ディレクトリを変更 |
-| `INVALID_PATH` | パストラバーサル試行など | 有効な相対パスを指定 |
-| `INTERNAL_ERROR` | ホスト側の予期せぬエラー | システム管理者に報告 |
-
 ---
 
 ## 9. エラーハンドリング & エージェントリカバリ
 
-LLMは時に不正・非効率なクエリを生成するため、システム側でのフェイルセーフとLLMへの**自律的リカバリ誘導**が重要です。
+LLMが誤った正規表現や広すぎる検索範囲を指定した際、自律的にクエリを修正してリトライできるようにエラー構造を設計しています。
 
 ### 9.1 タイムアウト時の自律リカバリフロー
 
 ```
-LLM: query=".+\n.+"（複雑な正規表現）
+LLM: query=".*.*.*.*" (ReDoSの可能性のあるクエリ)
   │
-  ├─► ホストAPI: 3秒タイマー開始
+  ├─► MCPサーバー: 3.0秒のタイムアウト監視下で rg 起動
   │
-  ├─► コンテナ実行: ReDoS発生 → 応答なし
+  ├─► プロセス側: ReDoSによるCPU占有発生
   │
-  ├─► 3秒経過: subprocess.TimeoutExpired → コンテナをkill
+  ├─► 3.0秒経過: subprocess.TimeoutExpired 発生、プロセスをKill
   │
-  └─► LLMへ返却:
+  └─► LLMへエラー返却:
         {
           "status": "error",
           "error": {
             "code": "TIMEOUT",
-            "message": "...",
+            "message": "検索クエリが複雑すぎるか、検索範囲が広すぎます。",
             "suggestion": "正規表現をシンプルにするか、ディレクトリを絞り込んでください。"
           }
         }
           │
-          └─► LLM: エラー内容を理解し、query="get_user" に修正してリトライ ✅
-```
-
-### 9.2 Truncation時の自律リカバリフロー
-
-```
-LLM: query="def "（汎用すぎる検索）
-  │
-  ├─► 20件上限到達: metadata.truncated=true
-  │
-  └─► LLMへ返却:
-        { "truncated": true, "suggestion": "file_extensions を絞り込んでください。" }
-          │
-          └─► LLM: file_extensions=["py"], target_dir="src/api/" で再検索 ✅
-```
-
-### 9.3 正規表現エラー時の自律リカバリフロー
-
-```
-LLM: query="class (Controller" （括弧閉じ忘れ）
-  │
-  ├─► Exit Code 2: stderrに "unclosed group" エラー
-  │
-  └─► LLMへ返却: ripgrep_error をそのまま転送
-        │
-        └─► LLM: "unclosed group" を読み、query="class \\w+Controller" に修正 ✅
+          └─► LLM: 提案に従い、より具体的なクエリに修正して再実行 ✅
 ```
 
 ---
 
 ## 10. セキュリティチェックリスト
 
-本モジュールをデプロイ前に必ず確認してください。
+リリース前に以下の設計が満たされているか検証すること。
 
-### ホストAPI層
-
-- [ ] 全入力パラメータを `sanitizer.py` で検証済み
-- [ ] `target_dir` のパストラバーサル（`..`）を検出してリジェクト
-- [ ] `file_extensions` のホワイトリスト検証（英数字のみ許可）
-- [ ] 正規表現の最大長制限（例: 500文字）
-- [ ] API認証（Bearer Token または API Key）の実装
-- [ ] レートリミットの実装（例: 60リクエスト/分/ユーザー）
-- [ ] 全実行を構造化ログ（JSON）で記録
-
-### Dockerサンドボックス層
-
-- [ ] `--read-only` フラグが有効
-- [ ] `--network none` フラグが有効
-- [ ] メモリ・CPU・PID制限が設定済み
-- [ ] `--cap-drop ALL` が設定済み
-- [ ] `--security-opt no-new-privileges` が設定済み
-- [ ] ボリュームマウントが `:ro`（読み取り専用）
-- [ ] コンテナイメージのバージョンが固定済み（`latest` タグ不使用）
-
-### 運用層
-
-- [ ] 本番環境でのDockerイメージ署名・検証の実施
-- [ ] コンテナイメージの定期的な脆弱性スキャン
-- [ ] ホストAPI側での実行タイムアウト監視
-- [ ] 異常なリクエスト頻度のアラート設定
+- [ ] `Path.resolve()` による親ディレクトリ参照（`..`）の完全な正規化と検証。
+- [ ] シンボリックリンクを介した脱出（ベースディレクトリ外への参照）が遮断されていること。
+- [ ] `subprocess` 呼び出しにおける `shell=True` の完全な排除。
+- [ ] タイムアウト（3.0秒）による実行プロセスの中断。
+- [ ] ファイルサイズ上限（10MB）による過大検索の抑止。
+- [ ] ログ出力（特に `print`）が標準出力（`sys.stdout`）へ書き込まれず、標準エラー出力（`sys.stderr`）に向いていること。
 
 ---
 
 ## 11. 依存関係・前提条件
 
 ### ホスト環境
+- **Python**: 3.11 以上
+- **ripgrep**: `rg` コマンドがシステムパス（PATH環境変数）に含まれていること。
 
-| 要件 | バージョン | 備考 |
-|---|---|---|
-| Docker Engine | 24.0以上 | `--pids-limit` サポートのため |
-| Python | 3.11以上 | ホストAPI実行環境 |
-| FastAPI | 0.110以上 | APIフレームワーク |
-| Pydantic | 2.x | バリデーション |
-
-### コンテナ内
-
-| 要件 | バージョン | 備考 |
-|---|---|---|
-| Alpine Linux | 3.19 | ベースイメージ |
-| ripgrep | 14.1.0 | バージョン固定推奨 |
-
-### 環境変数（`.env.example`）
-
-```dotenv
-# サンドボックス設定
-DOCKER_IMAGE=llm-grep-engine:1.0.0
-HOST_REPO_BASE_PATH=/data/repos
-EXECUTION_TIMEOUT_SEC=3
-
-# リソース制限
-MAX_MEMORY=256m
-MAX_CPUS=1.0
-MAX_PIDS=64
-
-# 検索制限
-DEFAULT_MAX_MATCHES=20
-MAX_CONTEXT_LINES=20
-MAX_QUERY_LENGTH=500
-
-# API設定
-API_HOST=0.0.0.0
-API_PORT=8080
-API_WORKERS=4
-```
+### パッケージ依存関係
+- `mcp>=0.1.0` (FastMCP機能を含む Python MCP SDK)
+- `pydantic>=2.0.0` (パラメータ検証用)
 
 ---
 
 ## 12. 今後の拡張方針
 
-| 優先度 | 拡張項目 | 概要 |
-|---|---|---|
-| 高 | **正規表現複雑度チェック** | `sanitizer.py` に静的解析を追加し、ReDoSリスクのあるパターンを事前に拒否 |
-| 高 | **結果のキャッシュ** | 同一クエリのRedisキャッシュ（TTL: 5分）でレスポンスを高速化 |
-| 中 | **マルチコンテナ並列実行** | 大規模リポジトリを対象にサブディレクトリ単位で並列検索 |
-| 中 | **構造的コード解析の統合** | Tree-sitterと組み合わせ、ASTベースの関数境界検出を追加 |
-| 低 | **検索履歴のLLMへの提供** | 重複クエリをLLMに通知し、検索効率を改善 |
-| 低 | **WebSocket対応** | 長時間検索のプログレス通知をストリーミングで提供 |
+1. **正規表現静的バリデーター**: 実行前に Python 側でクエリの複雑度をチェックし、ReDoS を事前検知する。
+2. **キャッシュ機構**: 頻繁に呼び出されるクエリ結果の短期キャッシュ。
+3. **ASTパーサーとの統合**: 単なる行ベースの検索に加え、シンボルの定義位置をツリーベースで返す機能の追加。
 
 ---
 
 ## 付録A: ripgrep JSONL出力フォーマット（参考）
 
-ホスト側でのパース対象となるripgrepの生出力フォーマットです。
-
 ```jsonl
-{"type":"begin","data":{"path":{"text":"src/api/auth.py"}}}
-{"type":"match","data":{"path":{"text":"src/api/auth.py"},"lines":{"text":"def get_user(token: str):\n"},"line_number":42,"absolute_offset":1024,"submatches":[{"match":{"text":"def get_user"},"start":0,"end":12}]}}
-{"type":"context","data":{"path":{"text":"src/api/auth.py"},"lines":{"text":"    return db.query(User)\n"},"line_number":43,"absolute_offset":1056}}
-{"type":"end","data":{"path":{"text":"src/api/auth.py"},"binary_offset":null,"stats":{"elapsed":{"secs":0,"nanos":123456,"human":"0.000123s"},"searches":1,"searches_with_match":1,"bytes_searched":2048,"bytes_printed":256,"matched_lines":1,"matches":1}}}
-{"type":"summary","data":{"elapsed_total":{"secs":0,"nanos":234567,"human":"0.000234s"},"stats":{"searches":5,"searches_with_match":2,"bytes_searched":10240,"bytes_printed":512,"matched_lines":2,"matches":2}}}
+{"type":"begin","data":{"path":{"text":"src/ripgrep_mcp/server.py"}}}
+{"type":"match","data":{"path":{"text":"src/ripgrep_mcp/server.py"},"lines":{"text":"def search_codebase(\n"},"line_number":28,"absolute_offset":512,"submatches":[{"match":{"text":"def search_codebase"},"start":0,"end":19}]}}
+{"type":"context","data":{"path":{"text":"src/ripgrep_mcp/server.py"},"lines":{"text":"    query: str,\n"},"line_number":29,"absolute_offset":532}}
+{"type":"end","data":{"path":{"text":"src/ripgrep_mcp/server.py"},"binary_offset":null,"stats":{"elapsed":{"secs":0,"nanos":12345},"searches":1,"searches_with_match":1,"bytes_searched":1024,"matched_lines":1,"matches":1}}}
 ```
