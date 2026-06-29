@@ -2,8 +2,8 @@ import pytest
 from pathlib import Path
 from pydantic import ValidationError
 
-from src.ripgrep_mcp.sanitizer import is_safe_path, SearchParams
-from src.ripgrep_mcp.command import build_rg_command, parse_ripgrep_output, FileMatch
+from ripgrep_mcp.sanitizer import is_safe_path, SearchParams
+from ripgrep_mcp.command import build_rg_command, parse_ripgrep_output, FileMatch
 
 def test_is_safe_path() -> None:
     base = Path("/workspace/project").resolve()
