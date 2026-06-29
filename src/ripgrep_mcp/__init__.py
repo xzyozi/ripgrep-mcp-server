@@ -1,0 +1,1 @@
+# ripgrep_mcp package
