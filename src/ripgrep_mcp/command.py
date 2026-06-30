@@ -2,6 +2,7 @@ import subprocess
 import json
 import logging
 import ast
+import time
 from pathlib import Path
 from typing import Dict, List, Any, Tuple
 from .sanitizer import SearchParams
@@ -9,6 +10,46 @@ from .sanitizer import SearchParams
 logger = logging.getLogger(__name__)
 
 MAX_RESPONSE_CHARS = 8000
+
+class CacheEntry:
+    def __init__(self, timestamp: float, response: Dict[str, Any]) -> None:
+        self.timestamp = timestamp
+        self.response = response
+
+class SearchCache:
+    def __init__(self, ttl: float = 30.0) -> None:
+        self.ttl = ttl
+        self._cache: Dict[Tuple[Any, ...], CacheEntry] = {}
+
+    def get(self, params: SearchParams) -> Dict[str, Any] | None:
+        key = (
+            params.query,
+            params.target_dir,
+            params.context_lines,
+            tuple(params.file_extensions),
+            params.max_matches
+        )
+        entry = self._cache.get(key)
+        if entry:
+            if time.time() - entry.timestamp < self.ttl:
+                return entry.response
+            del self._cache[key]  # TTL切れ
+        return None
+
+    def set(self, params: SearchParams, response: Dict[str, Any]) -> None:
+        key = (
+            params.query,
+            params.target_dir,
+            params.context_lines,
+            tuple(params.file_extensions),
+            params.max_matches
+        )
+        self._cache[key] = CacheEntry(time.time(), response)
+
+    def clear(self) -> None:
+        self._cache.clear()
+
+search_cache = SearchCache(ttl=30.0)
 
 class ScopeFinder(ast.NodeVisitor):
     def __init__(self) -> None:
@@ -204,14 +245,24 @@ def run_search(params: SearchParams, base_dir: Path) -> Dict[str, Any]:
     """
     サニタイズされたパラメータを受け取り、検索を実行してパースした結果を返す。
     """
+    # キャッシュの確認
+    cached_result = search_cache.get(params)
+    if cached_result is not None:
+        # キャッシュヒット時はメタデータに "cached": True を追加
+        response = cached_result.copy()
+        if "metadata" in response:
+            response["metadata"] = {**response["metadata"], "cached": True}
+        return response
+
     target_path = str((base_dir / params.target_dir).resolve())
     cmd = build_rg_command(params, target_path)
     
     returncode, stdout, stderr = execute_ripgrep(cmd)
     
+    response = {}
     if returncode == 0:
         results, truncated = parse_ripgrep_output(stdout, base_dir)
-        return {
+        response = {
             "status": "success",
             "metadata": {
                 "query": params.query,
@@ -222,7 +273,7 @@ def run_search(params: SearchParams, base_dir: Path) -> Dict[str, Any]:
         }
     elif returncode == 1:
         # マッチなし
-        return {
+        response = {
             "status": "success",
             "metadata": {
                 "query": params.query,
@@ -265,3 +316,9 @@ def run_search(params: SearchParams, base_dir: Path) -> Dict[str, Any]:
                 "ripgrep_error": ripgrep_err
             }
         }
+
+    # 正常系レスポンスのみキャッシュに保存する
+    if response.get("status") == "success":
+        search_cache.set(params, response)
+
+    return response

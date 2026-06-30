@@ -67,11 +67,26 @@ def main() -> None:
         "id": 1
     }
     
+    # 2回目のツール呼び出し (キャッシュが効くはず)
+    tool_request_cached = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "search_codebase",
+            "arguments": {
+                "query": "SearchParams",
+                "target_dir": "src"
+            }
+        },
+        "id": 2
+    }
+    
     # 複数メッセージを改行区切りで送信
     request_lines = [
         json.dumps(init_request),
         json.dumps(initialized_notification),
-        json.dumps(tool_request)
+        json.dumps(tool_request),
+        json.dumps(tool_request_cached)
     ]
     request_str = "\n".join(request_lines) + "\n"
     
@@ -80,8 +95,13 @@ def main() -> None:
         print(f"-> {req}")
     
     try:
-        # communicateを使用して安全にデータを送信し、出力を取得
-        stdout_output, stderr_output = process.communicate(input=request_str, timeout=3.0)
+        # 手動で書き込み、フラッシュして少し待つ (EOFによる早期終了を防ぐ)
+        process.stdin.write(request_str)
+        process.stdin.flush()
+        time.sleep(0.5)
+        
+        # 残りのデータを回収しプロセスを終了させる
+        stdout_output, stderr_output = process.communicate(timeout=2.0)
         
         # 出力を改行で分割
         stdout_lines = stdout_output.splitlines() if stdout_output else []
@@ -93,28 +113,46 @@ def main() -> None:
         if stderr_output:
             print(f"\nServer logs (stderr):\n{stderr_output.strip()}")
             
-        # 簡易検証 (tools/call の id である 1 のレスポンスを探す)
-        success = False
+        # 簡易検証 (id=1 の通常の成功と、id=2 のキャッシュ成功を確認)
+        success_id1 = False
+        success_id2 = False
+        
         for line in stdout_lines:
             if not line.strip():
                 continue
             try:
                 response_data = json.loads(line)
-                if response_data.get("id") == 1:
+                resp_id = response_data.get("id")
+                
+                if resp_id == 1:
                     if "result" in response_data:
-                        print("\n[SUCCESS] Response received and parsed successfully.")
-                        success = True
+                        print("\n[SUCCESS] Response for id=1 received and parsed successfully.")
+                        success_id1 = True
                     else:
                         print(f"\n[FAILED] Response for id=1 does not contain 'result' payload. Error: {response_data.get('error')}")
-                    break
+                        
+                elif resp_id == 2:
+                    if "result" in response_data:
+                        # キャッシュが入っていることを確認
+                        content_list = response_data["result"].get("content", [])
+                        if content_list:
+                            inner_text = content_list[0].get("text", "")
+                            inner_data = json.loads(inner_text)
+                            is_cached = inner_data.get("metadata", {}).get("cached", False)
+                            if is_cached:
+                                print("\n[SUCCESS] Response for id=2 was successfully served from cache ('cached': true).")
+                                success_id2 = True
+                            else:
+                                print("\n[FAILED] Response for id=2 was not cached.")
+                        else:
+                            print("\n[FAILED] Response for id=2 has no content text.")
+                    else:
+                        print(f"\n[FAILED] Response for id=2 does not contain 'result' payload. Error: {response_data.get('error')}")
             except Exception as parse_err:
                 print(f"Failed to parse line: {line}. Error: {parse_err}")
                 
-        if not success:
-            # id=1 のレスポンスが見つからなかった場合
-            has_id_1 = any(json.loads(l).get("id") == 1 for l in stdout_lines if l.strip())
-            if not has_id_1:
-                print("\n[FAILED] No response for tools/call (id=1) received from server.")
+        if not success_id1 or not success_id2:
+            print(f"\n[FAILED] Verification failed. Success ID1: {success_id1}, Success ID2: {success_id2}")
             
     except Exception as e:
         print(f"\n[ERROR] Verification failed: {e}")
