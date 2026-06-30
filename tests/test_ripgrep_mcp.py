@@ -2,7 +2,7 @@ import pytest
 from pathlib import Path
 from pydantic import ValidationError
 
-from ripgrep_mcp.sanitizer import is_safe_path, SearchParams
+from ripgrep_mcp.sanitizer import is_safe_path, SearchParams, is_safe_regex
 from ripgrep_mcp.command import build_rg_command, parse_ripgrep_output, FileMatch
 
 def test_is_safe_path() -> None:
@@ -89,3 +89,47 @@ def test_parse_ripgrep_output() -> None:
     assert "   1: def main():\n" in results[0]["code_snippet"]
     assert "   2:     print(\"hello\")\n" in results[0]["code_snippet"]
     assert truncated is False
+
+def test_is_safe_regex() -> None:
+    # 正常系 (安全なクエリ)
+    assert is_safe_regex("def test")[0] is True
+    assert is_safe_regex("class [A-Z]\\w+")[0] is True
+    assert is_safe_regex(".*")[0] is True
+    assert is_safe_regex("^[0-9]+$")[0] is True
+    assert is_safe_regex(r"\(escaped_parens\)*")[0] is True
+    assert is_safe_regex(r"\.\*")[0] is True
+    
+    # 異常系 (ネストされた量指定子)
+    assert is_safe_regex("(a+)+")[0] is False
+    assert is_safe_regex("(a*)*")[0] is False
+    assert is_safe_regex("(a?)+")[0] is False
+    assert is_safe_regex("(a{1,2})*")[0] is False
+    assert is_safe_regex("((a+)+)")[0] is False
+    
+    # 異常系 (曖昧なワイルドカードの連続)
+    assert is_safe_regex(".*.*")[0] is False
+    assert is_safe_regex(".+.*")[0] is False
+    assert is_safe_regex(".*.+")[0] is False
+    assert is_safe_regex(".*  .*")[0] is False
+    assert is_safe_regex(".*|.*")[0] is False
+    
+    # 異常系 (グループのネストが深すぎる)
+    assert is_safe_regex("(((((a)))))")[0] is False
+    
+    # 異常系 (クエリ長制限)
+    long_query = "a" * 151
+    assert is_safe_regex(long_query)[0] is False
+
+def test_search_params_regex_validation() -> None:
+    # 正常な正規表現は ValidationError を起こさない
+    params = SearchParams(query="[a-z]+", target_dir="src")
+    assert params.query == "[a-z]+"
+    
+    # 危険な正規表現は ValidationError を起こす
+    with pytest.raises(ValidationError) as exc_info:
+        SearchParams(query="(a+)+", target_dir="src")
+    assert "ReDoS" in str(exc_info.value)
+    
+    with pytest.raises(ValidationError) as exc_info:
+        SearchParams(query=".*.*", target_dir="src")
+    assert "ReDoS" in str(exc_info.value)
