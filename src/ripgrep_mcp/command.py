@@ -1,6 +1,7 @@
 import subprocess
 import json
 import logging
+import ast
 from pathlib import Path
 from typing import Dict, List, Any, Tuple
 from .sanitizer import SearchParams
@@ -9,13 +10,76 @@ logger = logging.getLogger(__name__)
 
 MAX_RESPONSE_CHARS = 8000
 
+class ScopeFinder(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.scopes: Dict[int, str] = {}  # line_number -> scope path string
+        self.current_path: List[str] = []
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.current_path.append(f"class {node.name}")
+        self._record_scope(node)
+        self.generic_visit(node)
+        self.current_path.pop()
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.current_path.append(f"def {node.name}")
+        self._record_scope(node)
+        self.generic_visit(node)
+        self.current_path.pop()
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.current_path.append(f"async def {node.name}")
+        self._record_scope(node)
+        self.generic_visit(node)
+        self.current_path.pop()
+
+    def _record_scope(self, node: ast.AST) -> None:
+        start = node.lineno
+        end = getattr(node, "end_lineno", start)
+        if end is None:
+            end = start
+        
+        path = " -> ".join(self.current_path)
+        for line in range(start, end + 1):
+            # より深いネスト構造のスコープを優先して上書き
+            self.scopes[line] = path
+
+def find_python_scopes(file_path: Path, line_numbers: List[int]) -> str:
+    """
+    Pythonファイルから指定された行番号のスコープ情報を取得する。
+    """
+    if not file_path.exists() or file_path.suffix != ".py":
+        return ""
+        
+    try:
+        content = file_path.read_text(encoding="utf-8", errors="ignore")
+        tree = ast.parse(content, filename=str(file_path))
+        finder = ScopeFinder()
+        finder.visit(tree)
+        
+        matched_scopes = []
+        for line in line_numbers:
+            scope = finder.scopes.get(line)
+            if scope and scope not in matched_scopes:
+                matched_scopes.append(scope)
+                
+        if matched_scopes:
+            return ", ".join(matched_scopes)
+    except Exception as e:
+        logger.debug(f"Failed to parse AST for {file_path}: {e}")
+        
+    return ""
+
 class FileMatch:
     def __init__(self, filepath: str) -> None:
         self.filepath = filepath
         self.lines: Dict[int, str] = {}
+        self.match_lines: set[int] = set()
 
-    def add_line(self, line_num: int, text: str) -> None:
+    def add_line(self, line_num: int, text: str, is_match: bool = False) -> None:
         self.lines[line_num] = text
+        if is_match:
+            self.match_lines.add(line_num)
 
     def get_snippet(self) -> str:
         sorted_lines = sorted(self.lines.items())
@@ -97,11 +161,12 @@ def parse_ripgrep_output(stdout: str, base_dir: Path) -> Tuple[List[Dict[str, An
                 
                 line_num = payload.get("line_number")
                 line_text = payload.get("lines", {}).get("text", "")
+                is_match = (dtype == "match")
                 
                 if rel_path not in file_matches:
                     file_matches[rel_path] = FileMatch(rel_path)
                 
-                file_matches[rel_path].add_line(line_num, line_text)
+                file_matches[rel_path].add_line(line_num, line_text, is_match)
         except json.JSONDecodeError:
             continue
             
@@ -111,16 +176,27 @@ def parse_ripgrep_output(stdout: str, base_dir: Path) -> Tuple[List[Dict[str, An
     
     for rel_path, match in file_matches.items():
         snippet = match.get_snippet()
-        snippet_len = len(snippet) + len(rel_path) + 100
+        
+        # ASTからスコープ情報を解決 (Pythonのみ)
+        scope = ""
+        if rel_path.endswith(".py"):
+            abs_path = base_dir / rel_path
+            scope = find_python_scopes(abs_path, sorted(list(match.match_lines)))
+            
+        snippet_len = len(snippet) + len(rel_path) + len(scope) + 100
         if total_chars + snippet_len > MAX_RESPONSE_CHARS:
             truncated = True
             break
         
-        results.append({
+        item = {
             "file": rel_path.replace("\\", "/"),  # Windowsパスの区切り文字を一貫してスラッシュに統一
             "code_snippet": snippet
-        })
-        total_chars += len(snippet)
+        }
+        if scope:
+            item["scope"] = scope
+            
+        results.append(item)
+        total_chars += len(snippet) + len(scope)
         
     return results, truncated
 

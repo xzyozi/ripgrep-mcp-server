@@ -3,7 +3,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from ripgrep_mcp.sanitizer import is_safe_path, SearchParams, is_safe_regex
-from ripgrep_mcp.command import build_rg_command, parse_ripgrep_output, FileMatch
+from ripgrep_mcp.command import build_rg_command, parse_ripgrep_output, FileMatch, find_python_scopes
 
 def test_is_safe_path() -> None:
     base = Path("/workspace/project").resolve()
@@ -133,3 +133,64 @@ def test_search_params_regex_validation() -> None:
     with pytest.raises(ValidationError) as exc_info:
         SearchParams(query=".*.*", target_dir="src")
     assert "ReDoS" in str(exc_info.value)
+
+def test_ast_scope_resolution(tmp_path: Path) -> None:
+    # テスト用の一時的なPythonファイルを作成
+    test_code = (
+        "class MyClass:\n"
+        "    def method_one(self):\n"
+        "        pass\n"
+        "\n"
+        "    async def async_method(self):\n"
+        "        x = 10\n"
+        "        return x\n"
+        "\n"
+        "def global_func():\n"
+        "    pass\n"
+    )
+    test_file = tmp_path / "dummy.py"
+    test_file.write_text(test_code, encoding="utf-8")
+    
+    # 2行目 (method_one)
+    scope_2 = find_python_scopes(test_file, [2])
+    assert scope_2 == "class MyClass -> def method_one"
+    
+    # 6行目 (async_method の内部ボディ)
+    scope_6 = find_python_scopes(test_file, [6])
+    assert scope_6 == "class MyClass -> async def async_method"
+    
+    # 9行目 (global_func)
+    scope_9 = find_python_scopes(test_file, [9])
+    assert scope_9 == "def global_func"
+    
+    # 複数行の複合スコープ
+    scope_multi = find_python_scopes(test_file, [2, 6])
+    assert scope_multi == "class MyClass -> def method_one, class MyClass -> async def async_method"
+    
+    # クラス直下の行
+    scope_1 = find_python_scopes(test_file, [1])
+    assert scope_1 == "class MyClass"
+
+def test_parse_ripgrep_output_with_scope(tmp_path: Path) -> None:
+    # `parse_ripgrep_output` にて Pythonファイルのスコープが追加されることを検証
+    test_code = (
+        "class Controller:\n"
+        "    def index(self):\n"
+        "        return 'hello'\n"
+    )
+    # 実際のファイルが必要なので、tmp_path に作成
+    (tmp_path / "src").mkdir()
+    py_file = tmp_path / "src" / "controller.py"
+    py_file.write_text(test_code, encoding="utf-8")
+    
+    # ripgrep の jsonl 擬似出力
+    mock_stdout = (
+        f'{{"type":"match","data":{{"path":{{"text":"{py_file.as_posix()}"}},"lines":{{"text":"        return \'hello\'\\\\n"}},"line_number":3}}}}\n'
+    )
+    
+    results, truncated = parse_ripgrep_output(mock_stdout, tmp_path)
+    
+    assert len(results) == 1
+    assert results[0]["file"] == "src/controller.py"
+    assert "scope" in results[0]
+    assert results[0]["scope"] == "class Controller -> def index"
