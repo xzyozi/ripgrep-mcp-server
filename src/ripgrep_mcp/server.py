@@ -70,10 +70,12 @@ def search_codebase(
     :param token_budget: (任意) 今回の検索結果に割り当てる最大トークン数。デフォルトは環境設定に従います。
     """
     # 1. 内部パラメータの自動補完 (LLMに推論させず、システムでよしなに決定する)
-    # ※ token_budget に基づいて max_matches 等を動的に調整するロジックをここに挟むことも可能です
     file_extensions = []
     context_lines = 3
     max_matches = 20
+
+    # token_budget が指定された場合、それをベースに文字数上限を算出 (3文字 = 1トークン)
+    dynamic_char_limit = (token_budget * 3) if token_budget else 8000
 
     try:
         params = SearchParams(
@@ -94,7 +96,13 @@ def search_codebase(
     raw_result = run_search(params, BASE_DIR)
     
     # 3. マークダウンへのパースと返却
-    return format_to_markdown(raw_result)
+    md_result = format_to_markdown(raw_result)
+    
+    # 動的なトークン予算による切り詰め
+    if len(md_result) > dynamic_char_limit:
+        md_result = md_result[:dynamic_char_limit] + "\n\n[システム通知: トークン予算上限に達したため検索結果が途中で切り捨てられました]"
+        
+    return md_result
 
 if __name__ == "__main__":
     mcp.run()

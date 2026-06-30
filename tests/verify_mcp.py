@@ -81,12 +81,28 @@ def main() -> None:
         "id": 2
     }
     
+    # 3回目のツール呼び出し (token_budgetを指定して動的な切り捨てを検証)
+    tool_request_budget = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "search_codebase",
+            "arguments": {
+                "query": "SearchParams",
+                "target_dir": "src",
+                "token_budget": 50
+            }
+        },
+        "id": 3
+    }
+    
     # 複数メッセージを改行区切りで送信
     request_lines = [
         json.dumps(init_request),
         json.dumps(initialized_notification),
         json.dumps(tool_request),
-        json.dumps(tool_request_cached)
+        json.dumps(tool_request_cached),
+        json.dumps(tool_request_budget)
     ]
     request_str = "\n".join(request_lines) + "\n"
     
@@ -95,16 +111,30 @@ def main() -> None:
         print(f"-> {req}")
     
     try:
-        # 手動で書き込み、フラッシュして少し待つ (EOFによる早期終了を防ぐ)
+        # 手動で書き込み、フラッシュする
         process.stdin.write(request_str)
         process.stdin.flush()
-        time.sleep(0.5)
         
-        # 残りのデータを回収しプロセスを終了させる
-        stdout_output, stderr_output = process.communicate(timeout=2.0)
+        # 4つのレスポンス (initialize, id=1, id=2, id=3) が返ってくるまで同期的に待つ
+        stdout_lines = []
+        expected_responses = 4
         
-        # 出力を改行で分割
-        stdout_lines = stdout_output.splitlines() if stdout_output else []
+        for i in range(expected_responses):
+            line = process.stdout.readline()
+            if not line:
+                print(f"\n[WARNING] stdout closed early at response {i+1}/{expected_responses}")
+                break
+            stdout_lines.append(line)
+        
+        # その後 stdin を閉じて終了させる
+        process.stdin.close()
+        try:
+            stderr_output = process.stderr.read()
+        except Exception as read_err:
+            stderr_output = f"Could not read stderr: {read_err}"
+            
+        process.wait(timeout=2.0)
+        
         print("\nReceived responses from stdout:")
         for line in stdout_lines:
             print(f"<- {line.strip()}")
@@ -113,9 +143,10 @@ def main() -> None:
         if stderr_output:
             print(f"\nServer logs (stderr):\n{stderr_output.strip()}")
             
-        # 簡易検証 (id=1 の通常の成功と、id=2 のキャッシュ成功を確認)
+        # 簡易検証 (id=1 の通常の成功、id=2 のキャッシュ成功、id=3 のトークン切り捨てを確認)
         success_id1 = False
         success_id2 = False
+        success_id3 = False
         
         for line in stdout_lines:
             if not line.strip():
@@ -147,11 +178,27 @@ def main() -> None:
                             print("\n[FAILED] Response for id=2 has no content text.")
                     else:
                         print(f"\n[FAILED] Response for id=2 does not contain 'result' payload. Error: {response_data.get('error')}")
+                        
+                elif resp_id == 3:
+                    if "result" in response_data:
+                        # トークン制限で切り捨てられていることを確認
+                        content_list = response_data["result"].get("content", [])
+                        if content_list:
+                            inner_text = content_list[0].get("text", "")
+                            if "トークン予算上限に達したため検索結果が途中で切り捨てられました" in inner_text:
+                                print("\n[SUCCESS] Response for id=3 was successfully truncated by token_budget.")
+                                success_id3 = True
+                            else:
+                                print("\n[FAILED] Response for id=3 was not truncated.")
+                        else:
+                            print("\n[FAILED] Response for id=3 has no content text.")
+                    else:
+                        print(f"\n[FAILED] Response for id=3 does not contain 'result' payload. Error: {response_data.get('error')}")
             except Exception as parse_err:
                 print(f"Failed to parse line: {line}. Error: {parse_err}")
                 
-        if not success_id1 or not success_id2:
-            print(f"\n[FAILED] Verification failed. Success ID1: {success_id1}, Success ID2: {success_id2}")
+        if not success_id1 or not success_id2 or not success_id3:
+            print(f"\n[FAILED] Verification failed. Success ID1: {success_id1}, Success ID2: {success_id2}, Success ID3: {success_id3}")
             
     except Exception as e:
         print(f"\n[ERROR] Verification failed: {e}")
