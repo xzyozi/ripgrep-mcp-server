@@ -137,9 +137,8 @@ def main() -> None:
                         content_list = response_data["result"].get("content", [])
                         if content_list:
                             inner_text = content_list[0].get("text", "")
-                            inner_data = json.loads(inner_text)
-                            is_cached = inner_data.get("metadata", {}).get("cached", False)
-                            if is_cached:
+                            # マークダウン内のキャッシュ通知マークを確認
+                            if "⚡ Cached Result" in inner_text:
                                 print("\n[SUCCESS] Response for id=2 was successfully served from cache ('cached': true).")
                                 success_id2 = True
                             else:

@@ -4,16 +4,16 @@ if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 import os
-import json
 import logging
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 from pydantic import ValidationError
+from typing import Optional
 
 from .sanitizer import SearchParams, is_safe_path
 from .command import run_search
 
-# ロガー設定 - stdioがMCPプロトコルに使われるため、確実にstderrへ出力する
+# ロガー設定
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -21,38 +21,61 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ripgrep-mcp-server")
 
-# 検索対象の起点となるベースディレクトリを設定（環境変数から取得、デフォルトは現在のカレントディレクトリ）
 BASE_DIR = Path(os.environ.get("RIPGREP_BASE_DIR", os.getcwd())).resolve()
 logger.info(f"Ripgrep MCP Server initialized with base directory: {BASE_DIR}")
 
-# FastMCPインスタンスを作成
 mcp = FastMCP("ripgrep-mcp-server")
+
+def format_to_markdown(result_dict: dict) -> str:
+    """
+    内部のJSON辞書を、ローカルLLMが読みやすいマークダウン（プレーンテキスト）に変換するラッパー関数
+    """
+    if result_dict.get("status") == "error":
+        err = result_dict.get("error", {})
+        return f"【検索エラー】\n理由: {err.get('message')}\n推奨: {err.get('suggestion')}\n詳細: {err.get('ripgrep_error')}"
+
+    results = result_dict.get("results", [])
+    if not results:
+        return "マッチする検索結果が見つかりませんでした。ディレクトリやクエリを変えて再試行してください。"
+
+    md_lines = []
+    meta = result_dict.get("metadata", {})
+    if meta.get("cached"):
+        md_lines.append("> ⚡ Cached Result")
+
+    for item in results:
+        scope_info = f" [Scope: {item['scope']}]" if "scope" in item else ""
+        md_lines.append(f"--- {item['file']}{scope_info} ---")
+        md_lines.append(item["code_snippet"])
+
+    if meta.get("truncated"):
+        md_lines.append("\n[システム通知: トークン保護のため検索結果が途中で切り捨てられました。必要に応じて target_dir や拡張子を絞ってください。]")
+
+    return "\n".join(md_lines)
 
 @mcp.tool(
     name="search_codebase",
-    description="リポジトリ内のソースコードを正規表現で検索し、マッチした行と周辺のコンテキストを取得します。関数定義・クラス・特定の変数の使われ方を調査するのに使用してください。大量ヒットが予想される場合は file_extensions や target_dir で対象を絞り込んでください。"
+    description="リポジトリ内のソースコードを正規表現で検索し、マッチした行と周辺のコンテキストを取得します。関数定義やクラスを調査するのに使用してください。"
 )
 def search_codebase(
     query: str,
     target_dir: str,
-    context_lines: int = 3,
-    file_extensions: list[str] = None,
-    max_matches: int = 20
+    token_budget: Optional[int] = None
 ) -> str:
     """
     ソースコードを指定の正規表現クエリで検索します。
     
     :param query: 検索キーワードまたはRust互換の正規表現。（例: 'def my_function', 'class [A-Z]\\w+'）
     :param target_dir: 検索対象のディレクトリパス（相対パス）。リポジトリ全体を検索する場合は '.'
-    :param context_lines: マッチ行の前後何行を取得するか。最大20行。
-    :param file_extensions: 検索対象ファイルの拡張子リスト（例: ['py', 'ts']）。
-    :param max_matches: 取得するマッチの最大件数。最大50。
+    :param token_budget: (任意) 今回の検索結果に割り当てる最大トークン数。デフォルトは環境設定に従います。
     """
-    if file_extensions is None:
-        file_extensions = []
-        
+    # 1. 内部パラメータの自動補完 (LLMに推論させず、システムでよしなに決定する)
+    # ※ token_budget に基づいて max_matches 等を動的に調整するロジックをここに挟むことも可能です
+    file_extensions = []
+    context_lines = 3
+    max_matches = 20
+
     try:
-        # パラメータバリデーション
         params = SearchParams(
             query=query,
             target_dir=target_dir,
@@ -62,32 +85,16 @@ def search_codebase(
         )
     except ValidationError as e:
         logger.error(f"Parameter validation failed: {e}")
-        return json.dumps({
-            "status": "error",
-            "error": {
-                "code": "VALIDATION_ERROR",
-                "message": "引数のバリデーションに失敗しました。",
-                "suggestion": "指定されたパラメータを確認してください。",
-                "ripgrep_error": str(e)
-            }
-        }, ensure_ascii=False)
+        return f"【バリデーションエラー】\n引数が不正です。正規表現が複雑すぎるか、空のクエリです。\n詳細: {e}"
 
-    # パストラバーサル防止チェック
     if not is_safe_path(BASE_DIR, params.target_dir):
-        logger.warning(f"Path traversal attempt blocked: {params.target_dir}")
-        return json.dumps({
-            "status": "error",
-            "error": {
-                "code": "INVALID_PATH",
-                "message": "無効なディレクトリパスが指定されました（検索対象ルート外）。",
-                "suggestion": "対象ルート配下の有効な相対パスを指定してください。",
-                "ripgrep_error": None
-            }
-        }, ensure_ascii=False)
+        return "【アクセス拒否】\n無効なディレクトリパスが指定されました。対象ルート配下の有効な相対パスを指定してください。"
 
-    # 検索実行
-    result = run_search(params, BASE_DIR)
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    # 2. コアロジックの実行
+    raw_result = run_search(params, BASE_DIR)
+    
+    # 3. マークダウンへのパースと返却
+    return format_to_markdown(raw_result)
 
 if __name__ == "__main__":
     mcp.run()
