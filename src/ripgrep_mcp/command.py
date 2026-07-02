@@ -263,6 +263,74 @@ def parse_ripgrep_output(stdout: str, base_dir: Path) -> Tuple[List[Dict[str, An
         
     return results, truncated
 
+def build_search_response(
+    returncode: int,
+    stdout: str,
+    stderr: str,
+    params: SearchParams,
+    base_dir: Path
+) -> Dict[str, Any]:
+    """
+    ripgrepの実行結果（リターンコード）から、MCPサーバー用の標準的なレスポンス構造を組み立てる。
+    """
+    match returncode:
+        case 0:
+            results, truncated = parse_ripgrep_output(stdout, base_dir)
+            return {
+                "status": "success",
+                "metadata": {
+                    "query": params.query,
+                    "target_dir": params.target_dir,
+                    "truncated": truncated
+                },
+                "results": results
+            }
+        case 1:
+            # マッチなし
+            return {
+                "status": "success",
+                "metadata": {
+                    "query": params.query,
+                    "target_dir": params.target_dir,
+                    "truncated": False
+                },
+                "results": []
+            }
+        case -1:
+            return {
+                "status": "error",
+                "error": {
+                    "code": "TIMEOUT",
+                    "message": "検索クエリが複雑すぎるか、検索範囲が広すぎます。",
+                    "suggestion": "正規表現をシンプルにするか、ディレクトリを絞り込んでください。",
+                    "ripgrep_error": None
+                }
+            }
+        case -2:
+            return {
+                "status": "error",
+                "error": {
+                    "code": "RIPGREP_NOT_FOUND",
+                    "message": "システムにripgrep (rg) がインストールされていません。",
+                    "suggestion": "ホスト環境にripgrepをインストールしてください。",
+                    "ripgrep_error": None
+                }
+            }
+        case _:
+            # その他のエラー（正規表現構文エラー、INTERNAL_ERROR など）
+            ripgrep_err = stderr.strip() if stderr else "Unknown error"
+            code = "REGEX_ERROR" if "regex" in ripgrep_err.lower() or returncode == 2 else "INTERNAL_ERROR"
+            message = "検索中にエラーが発生しました。" if code == "INTERNAL_ERROR" else "正規表現の構文エラーです。"
+            return {
+                "status": "error",
+                "error": {
+                    "code": code,
+                    "message": message,
+                    "suggestion": "正規表現を修正するか、設定を確認してください。",
+                    "ripgrep_error": ripgrep_err
+                }
+            }
+
 async def run_search(params: SearchParams, base_dir: Path) -> Dict[str, Any]:
     """
     サニタイズされたパラメータを受け取り、検索を実行してパースした結果を返す。
@@ -281,63 +349,7 @@ async def run_search(params: SearchParams, base_dir: Path) -> Dict[str, Any]:
     
     returncode, stdout, stderr = await execute_ripgrep(cmd)
     
-    response = {}
-    if returncode == 0:
-        results, truncated = parse_ripgrep_output(stdout, base_dir)
-        response = {
-            "status": "success",
-            "metadata": {
-                "query": params.query,
-                "target_dir": params.target_dir,
-                "truncated": truncated
-            },
-            "results": results
-        }
-    elif returncode == 1:
-        # マッチなし
-        response = {
-            "status": "success",
-            "metadata": {
-                "query": params.query,
-                "target_dir": params.target_dir,
-                "truncated": False
-            },
-            "results": []
-        }
-    elif returncode == -1:
-        return {
-            "status": "error",
-            "error": {
-                "code": "TIMEOUT",
-                "message": "検索クエリが複雑すぎるか、検索範囲が広すぎます。",
-                "suggestion": "正規表現をシンプルにするか、ディレクトリを絞り込んでください。",
-                "ripgrep_error": None
-            }
-        }
-    elif returncode == -2:
-        return {
-            "status": "error",
-            "error": {
-                "code": "RIPGREP_NOT_FOUND",
-                "message": "システムにripgrep (rg) がインストールされていません。",
-                "suggestion": "ホスト環境にripgrepをインストールしてください。",
-                "ripgrep_error": None
-            }
-        }
-    else:
-        # その他のエラー（正規表現構文エラーなど）
-        # ripgrepのエラー内容はstderrに出力されるため、それをLLMへ返す
-        ripgrep_err = stderr.strip() if stderr else "Unknown error"
-        code = "REGEX_ERROR" if "regex" in ripgrep_err.lower() or returncode == 2 else "INTERNAL_ERROR"
-        return {
-            "status": "error",
-            "error": {
-                "code": code,
-                "message": "検索中にエラーが発生しました。" if code == "INTERNAL_ERROR" else "正規表現の構文エラーです。",
-                "suggestion": "正規表現を修正するか、設定を確認してください。",
-                "ripgrep_error": ripgrep_err
-            }
-        }
+    response = build_search_response(returncode, stdout, stderr, params, base_dir)
 
     # 正常系レスポンスのみキャッシュに保存する
     if response.get("status") == "success":
