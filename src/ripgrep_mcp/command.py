@@ -1,11 +1,11 @@
-import subprocess
+import os
 import json
 import logging
 import asyncio
 import ast
 import time
 from pathlib import Path
-from typing import Dict, List, Any, Tuple
+from typing import Any
 from .sanitizer import SearchParams
 
 logger = logging.getLogger(__name__)
@@ -13,16 +13,17 @@ logger = logging.getLogger(__name__)
 MAX_RESPONSE_CHARS = 8000
 
 class CacheEntry:
-    def __init__(self, timestamp: float, response: Dict[str, Any]) -> None:
+    def __init__(self, timestamp: float, response: dict[str, Any]) -> None:
         self.timestamp = timestamp
         self.response = response
 
 class SearchCache:
-    def __init__(self, ttl: float = 30.0) -> None:
+    def __init__(self, ttl: float = 30.0, max_size: int = 100) -> None:
         self.ttl = ttl
-        self._cache: Dict[Tuple[Any, ...], CacheEntry] = {}
+        self.max_size = max_size
+        self._cache: dict[tuple[Any, ...], CacheEntry] = {}
 
-    def get(self, params: SearchParams) -> Dict[str, Any] | None:
+    def get(self, params: SearchParams) -> dict[str, Any] | None:
         key = (
             params.query,
             params.target_dir,
@@ -37,7 +38,12 @@ class SearchCache:
             del self._cache[key]  # TTL切れ
         return None
 
-    def set(self, params: SearchParams, response: Dict[str, Any]) -> None:
+    def set(self, params: SearchParams, response: dict[str, Any]) -> None:
+        # キャッシュが上限に達したら最古のキー（辞書の先頭）を削除
+        if len(self._cache) >= self.max_size:
+            oldest_key = next(iter(self._cache))
+            del self._cache[oldest_key]
+
         key = (
             params.query,
             params.target_dir,
@@ -86,7 +92,7 @@ class ScopeFinder(ast.NodeVisitor):
             # より深いネスト構造のスコープを優先して上書き
             self.scopes[line] = path
 
-def find_python_scopes(file_path: Path, line_numbers: List[int]) -> str:
+def find_python_scopes(file_path: Path, line_numbers: list[int]) -> str:
     """
     Pythonファイルから指定された行番号のスコープ情報を取得する。
     """
@@ -107,15 +113,17 @@ def find_python_scopes(file_path: Path, line_numbers: List[int]) -> str:
                 
         if matched_scopes:
             return ", ".join(matched_scopes)
-    except Exception as e:
+    except (SyntaxError, ValueError) as e:
         logger.debug(f"Failed to parse AST for {file_path}: {e}")
+    except Exception as e:
+        logger.warning(f"Unexpected error reading/parsing {file_path}: {e}")
         
     return ""
 
 class FileMatch:
     def __init__(self, filepath: str) -> None:
         self.filepath = filepath
-        self.lines: Dict[int, str] = {}
+        self.lines: dict[int, str] = {}
         self.match_lines: set[int] = set()
 
     def add_line(self, line_num: int, text: str, is_match: bool = False) -> None:
@@ -137,7 +145,7 @@ class FileMatch:
             last_num = num
         return "".join(result)
 
-def build_rg_command(params: SearchParams, target_path: str) -> List[str]:
+def build_rg_command(params: SearchParams, target_path: str) -> list[str]:
     """
     ripgrepのコマンドライン引数リストを安全に組み立てる。
     """
@@ -155,11 +163,10 @@ def build_rg_command(params: SearchParams, target_path: str) -> List[str]:
     cmd.extend(["--", params.query, target_path])
     return cmd
 
-async def execute_ripgrep(cmd: List[str], timeout: float = 3.0) -> Tuple[int, str, str]:
+async def execute_ripgrep(cmd: list[str], timeout: float = 3.0) -> tuple[int, str, str]:
     """
     ripgrepプロセスを安全に非同期実行する。シェルを経由しないことでコマンドインジェクションを防御。
     """
-    import os
     env = os.environ.copy()
     try:
         # プロセス非同期生成 (Windows環境等のWinsockエラーを防ぐため環境変数を渡す)
@@ -192,18 +199,18 @@ async def execute_ripgrep(cmd: List[str], timeout: float = 3.0) -> Tuple[int, st
             await process.wait()
             return -1, "", "TIMEOUT"
             
-    except FileNotFoundError:
-        logger.error("ripgrep (rg) command was not found on the system.")
-        return -2, "", "RIPGREP_NOT_FOUND"
+    except OSError as e:
+        logger.error(f"ripgrep (rg) command execution failed: {e}")
+        return -2, "", "RIPGREP_EXEC_ERROR"
     except Exception as e:
         logger.error(f"Unexpected error executing ripgrep: {e}", exc_info=True)
         return -99, "", str(e)
 
-def parse_ripgrep_output(stdout: str, base_dir: Path) -> Tuple[List[Dict[str, Any]], bool]:
+def parse_ripgrep_output(stdout: str, base_dir: Path) -> tuple[list[dict[str, Any]], bool]:
     """
     ripgrepのJSONL出力をパースし、ファイルごとに行番号付きでコードスニペットをまとめる。
     """
-    file_matches: Dict[str, FileMatch] = {}
+    file_matches: dict[str, FileMatch] = {}
     
     for line in stdout.splitlines():
         if not line.strip():
@@ -269,7 +276,7 @@ def build_search_response(
     stderr: str,
     params: SearchParams,
     base_dir: Path
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     ripgrepの実行結果（リターンコード）から、MCPサーバー用の標準的なレスポンス構造を組み立てる。
     """
@@ -310,10 +317,10 @@ def build_search_response(
             return {
                 "status": "error",
                 "error": {
-                    "code": "RIPGREP_NOT_FOUND",
-                    "message": "システムにripgrep (rg) がインストールされていません。",
-                    "suggestion": "ホスト環境にripgrepをインストールしてください。",
-                    "ripgrep_error": None
+                    "code": "RIPGREP_EXEC_ERROR",
+                    "message": "ripgrepの実行ファイルが見つからないか、実行権限がありません。",
+                    "suggestion": "システム環境にripgrepが正しくインストールされ、実行可能パスが通っていることを確認してください。",
+                    "ripgrep_error": stderr.strip() if stderr else None
                 }
             }
         case _:
@@ -331,7 +338,7 @@ def build_search_response(
                 }
             }
 
-async def run_search(params: SearchParams, base_dir: Path) -> Dict[str, Any]:
+async def run_search(params: SearchParams, base_dir: Path) -> dict[str, Any]:
     """
     サニタイズされたパラメータを受け取り、検索を実行してパースした結果を返す。
     """
@@ -344,8 +351,22 @@ async def run_search(params: SearchParams, base_dir: Path) -> Dict[str, Any]:
             response["metadata"] = {**response["metadata"], "cached": True}
         return response
 
-    target_path = str((base_dir / params.target_dir).resolve())
-    cmd = build_rg_command(params, target_path)
+    resolved_base = base_dir.resolve()
+    target_path_obj = (resolved_base / params.target_dir).resolve()
+    
+    # セキュリティチェック: ターゲットがbase_dir配下にあることを確認 (多層防御)
+    if not target_path_obj.is_relative_to(resolved_base):
+        return {
+            "status": "error",
+            "error": {
+                "code": "INVALID_PATH",
+                "message": "指定された検索パスが許可されたディレクトリの外部を指しています。",
+                "suggestion": "対象ルート配下の有効な相対パスを指定してください。",
+                "ripgrep_error": None
+            }
+        }
+
+    cmd = build_rg_command(params, str(target_path_obj))
     
     returncode, stdout, stderr = await execute_ripgrep(cmd)
     
