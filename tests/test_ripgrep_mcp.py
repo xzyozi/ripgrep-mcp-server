@@ -195,7 +195,8 @@ def test_parse_ripgrep_output_with_scope(tmp_path: Path) -> None:
     assert "scope" in results[0]
     assert results[0]["scope"] == "class Controller -> def index"
 
-def test_search_cache_mechanism(tmp_path: Path) -> None:
+@pytest.mark.anyio
+async def test_search_cache_mechanism(tmp_path: Path) -> None:
     # キャッシュを一度クリア
     search_cache.clear()
     
@@ -208,19 +209,19 @@ def test_search_cache_mechanism(tmp_path: Path) -> None:
     py_file.write_text("print('hello')\n", encoding="utf-8")
     
     # 1回目の検索（キャッシュなし、実検索実行）
-    res1 = run_search(params, tmp_path)
+    res1 = await run_search(params, tmp_path)
     assert res1["status"] == "success"
     assert "cached" not in res1["metadata"]
     
     # 2回目の検索（キャッシュヒットするはず）
-    res2 = run_search(params, tmp_path)
+    res2 = await run_search(params, tmp_path)
     assert res2["status"] == "success"
     assert res2["metadata"].get("cached") is True
     assert len(res2["results"]) == len(res1["results"])
     
     # キャッシュクリアのテスト
     search_cache.clear()
-    res3 = run_search(params, tmp_path)
+    res3 = await run_search(params, tmp_path)
     assert res3["status"] == "success"
     assert "cached" not in res3["metadata"]
     
@@ -228,11 +229,11 @@ def test_search_cache_mechanism(tmp_path: Path) -> None:
     search_cache.clear()
     search_cache.ttl = 0.01  # TTLを非常に短くする
     
-    run_search(params, tmp_path)
+    await run_search(params, tmp_path)
     import time
     time.sleep(0.02)  # TTLを超えるのを待つ
     
-    res4 = run_search(params, tmp_path)
+    res4 = await run_search(params, tmp_path)
     assert res4["status"] == "success"
     assert "cached" not in res4["metadata"]  # キャッシュ切れのため、実スキャンされるはず
     

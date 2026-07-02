@@ -1,7 +1,5 @@
 import sys
 import asyncio
-if sys.platform == 'win32':
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 import os
 import logging
@@ -57,7 +55,7 @@ def format_to_markdown(result_dict: dict) -> str:
     name="search_codebase",
     description="リポジトリ内のソースコードを正規表現で検索し、マッチした行と周辺のコンテキストを取得します。関数定義やクラスを調査するのに使用してください。"
 )
-def search_codebase(
+async def search_codebase(
     query: str,
     target_dir: str,
     token_budget: Optional[int] = None
@@ -65,7 +63,7 @@ def search_codebase(
     """
     ソースコードを指定の正規表現クエリで検索します。
     
-    :param query: 検索キーワードまたはRust互換の正規表現。（例: 'def my_function', 'class [A-Z]\\w+'）
+    :param query: 検索キーワードまたはRust互換 of 正規表現。（例: 'def my_function', 'class [A-Z]\\w+'）
     :param target_dir: 検索対象のディレクトリパス（相対パス）。リポジトリ全体を検索する場合は '.'
     :param token_budget: (任意) 今回の検索結果に割り当てる最大トークン数。デフォルトは環境設定に従います。
     """
@@ -93,7 +91,7 @@ def search_codebase(
         return "【アクセス拒否】\n無効なディレクトリパスが指定されました。対象ルート配下の有効な相対パスを指定してください。"
 
     # 2. コアロジックの実行
-    raw_result = run_search(params, BASE_DIR)
+    raw_result = await run_search(params, BASE_DIR)
     
     # 3. マークダウンへのパースと返却
     md_result = format_to_markdown(raw_result)

@@ -1,8 +1,6 @@
 import sys
 import os
 import asyncio
-if sys.platform == 'win32':
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 import subprocess
 import json
@@ -30,7 +28,7 @@ def main() -> None:
     )
     
     # サーバーの初期起動待ち
-    time.sleep(0.5)
+    time.sleep(2.0)
     
     # 初期化メッセージ
     init_request = {
@@ -106,26 +104,47 @@ def main() -> None:
     ]
     request_str = "\n".join(request_lines) + "\n"
     
-    print("\nSending requests sequence to stdin...")
-    for req in request_lines:
-        print(f"-> {req}")
+    print("\nSending requests sequence to stdin sequentially...")
     
     try:
-        # 手動で書き込み、フラッシュする
-        process.stdin.write(request_str)
+        stdout_lines = []
+        
+        # 1. initialize と initialized の送信
+        print(f"-> {json.dumps(init_request)}")
+        process.stdin.write(json.dumps(init_request) + "\n")
+        print(f"-> {json.dumps(initialized_notification)}")
+        process.stdin.write(json.dumps(initialized_notification) + "\n")
         process.stdin.flush()
         
-        # 4つのレスポンス (initialize, id=1, id=2, id=3) が返ってくるまで同期的に待つ
-        stdout_lines = []
-        expected_responses = 4
-        
-        for i in range(expected_responses):
-            line = process.stdout.readline()
-            if not line:
-                print(f"\n[WARNING] stdout closed early at response {i+1}/{expected_responses}")
-                break
+        # initializeのレスポンスを受信
+        line = process.stdout.readline()
+        if line:
             stdout_lines.append(line)
-        
+            
+        # 2. 1回目のツール呼び出し（id=1）を送信してレスポンスを待つ
+        print(f"-> {json.dumps(tool_request)}")
+        process.stdin.write(json.dumps(tool_request) + "\n")
+        process.stdin.flush()
+        line = process.stdout.readline()
+        if line:
+            stdout_lines.append(line)
+            
+        # 3. 2回目のツール呼び出し（id=2, キャッシュヒットを期待）を送信してレスポンスを待つ
+        print(f"-> {json.dumps(tool_request_cached)}")
+        process.stdin.write(json.dumps(tool_request_cached) + "\n")
+        process.stdin.flush()
+        line = process.stdout.readline()
+        if line:
+            stdout_lines.append(line)
+            
+        # 4. 3回目のツール呼び出し（id=3, トークン制限）を送信してレスポンスを待つ
+        print(f"-> {json.dumps(tool_request_budget)}")
+        process.stdin.write(json.dumps(tool_request_budget) + "\n")
+        process.stdin.flush()
+        line = process.stdout.readline()
+        if line:
+            stdout_lines.append(line)
+            
         # その後 stdin を閉じて終了させる
         process.stdin.close()
         try:

@@ -1,6 +1,7 @@
 import subprocess
 import json
 import logging
+import asyncio
 import ast
 import time
 from pathlib import Path
@@ -154,27 +155,48 @@ def build_rg_command(params: SearchParams, target_path: str) -> List[str]:
     cmd.extend(["--", params.query, target_path])
     return cmd
 
-def execute_ripgrep(cmd: List[str], timeout: float = 3.0) -> Tuple[int, str, str]:
+async def execute_ripgrep(cmd: List[str], timeout: float = 3.0) -> Tuple[int, str, str]:
     """
-    ripgrepプロセスを安全に実行する。シェルを経由しないことでコマンドインジェクションを防御。
+    ripgrepプロセスを安全に非同期実行する。シェルを経由しないことでコマンドインジェクションを防御。
     """
+    import os
+    env = os.environ.copy()
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            shell=False
+        # プロセス非同期生成 (Windows環境等のWinsockエラーを防ぐため環境変数を渡す)
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env
         )
-        return result.returncode, result.stdout, result.stderr
-    except subprocess.TimeoutExpired:
-        logger.error("ripgrep command execution timed out.")
-        return -1, "", "TIMEOUT"
+        
+        try:
+            # wait_for を使用してタイムアウト制御しながら実行
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                process.communicate(),
+                timeout=timeout
+            )
+            returncode = process.returncode if process.returncode is not None else -1
+            return (
+                returncode,
+                stdout_bytes.decode('utf-8', errors='replace'),
+                stderr_bytes.decode('utf-8', errors='replace')
+            )
+        except asyncio.TimeoutError:
+            logger.error("ripgrep command execution timed out.")
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            await process.wait()
+            return -1, "", "TIMEOUT"
+            
     except FileNotFoundError:
         logger.error("ripgrep (rg) command was not found on the system.")
         return -2, "", "RIPGREP_NOT_FOUND"
     except Exception as e:
-        logger.error(f"Unexpected error running ripgrep: {e}", exc_info=True)
+        logger.error(f"Unexpected error executing ripgrep: {e}", exc_info=True)
         return -99, "", str(e)
 
 def parse_ripgrep_output(stdout: str, base_dir: Path) -> Tuple[List[Dict[str, Any]], bool]:
@@ -241,7 +263,7 @@ def parse_ripgrep_output(stdout: str, base_dir: Path) -> Tuple[List[Dict[str, An
         
     return results, truncated
 
-def run_search(params: SearchParams, base_dir: Path) -> Dict[str, Any]:
+async def run_search(params: SearchParams, base_dir: Path) -> Dict[str, Any]:
     """
     サニタイズされたパラメータを受け取り、検索を実行してパースした結果を返す。
     """
@@ -257,7 +279,7 @@ def run_search(params: SearchParams, base_dir: Path) -> Dict[str, Any]:
     target_path = str((base_dir / params.target_dir).resolve())
     cmd = build_rg_command(params, target_path)
     
-    returncode, stdout, stderr = execute_ripgrep(cmd)
+    returncode, stdout, stderr = await execute_ripgrep(cmd)
     
     response = {}
     if returncode == 0:
