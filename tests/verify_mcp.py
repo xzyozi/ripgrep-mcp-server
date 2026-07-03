@@ -27,6 +27,10 @@ def main() -> None:
         env=env
     )
     
+    assert process.stdin is not None
+    assert process.stdout is not None
+    assert process.stderr is not None
+    
     # サーバーの初期起動待ち
     time.sleep(2.0)
     
