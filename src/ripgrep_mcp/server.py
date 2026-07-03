@@ -1,15 +1,14 @@
-import sys
-import asyncio
-
-import os
 import logging
+import os
 from pathlib import Path
-from mcp.server.fastmcp import FastMCP
-from pydantic import ValidationError
+import sys
 from typing import Optional
 
-from .sanitizer import SearchParams, is_safe_path
+from mcp.server.fastmcp import FastMCP
+from pydantic import ValidationError
+
 from .command import run_search
+from .sanitizer import SearchParams, is_safe_path
 
 # ロガー設定
 logging.basicConfig(
@@ -30,7 +29,12 @@ def format_to_markdown(result_dict: dict) -> str:
     """
     if result_dict.get("status") == "error":
         err = result_dict.get("error", {})
-        return f"【検索エラー】\n理由: {err.get('message')}\n推奨: {err.get('suggestion')}\n詳細: {err.get('ripgrep_error')}"
+        return (
+            f"【検索エラー】\n"
+            f"理由: {err.get('message')}\n"
+            f"推奨: {err.get('suggestion')}\n"
+            f"詳細: {err.get('ripgrep_error')}"
+        )
 
     results = result_dict.get("results", [])
     if not results:
@@ -47,7 +51,10 @@ def format_to_markdown(result_dict: dict) -> str:
         md_lines.append(item["code_snippet"])
 
     if meta.get("truncated"):
-        md_lines.append("\n[システム通知: トークン保護のため検索結果が途中で切り捨てられました。必要に応じて target_dir や拡張子を絞ってください。]")
+        md_lines.append(
+            "\n[システム通知: トークン保護のため検索結果が途中で切り捨てられました。"
+            "必要に応じて target_dir や拡張子を絞ってください。]"
+        )
 
     return "\n".join(md_lines)
 
@@ -62,13 +69,13 @@ async def search_codebase(
 ) -> str:
     """
     ソースコードを指定の正規表現クエリで検索します。
-    
-    :param query: 検索キーワードまたはRust互換 of 正規表現。（例: 'def my_function', 'class [A-Z]\\w+'）
+
+    :param query: 検索キーワードまたはRust互換の正規表現。（例: 'def my_function', 'class [A-Z]\\w+'）
     :param target_dir: 検索対象のディレクトリパス（相対パス）。リポジトリ全体を検索する場合は '.'
     :param token_budget: (任意) 今回の検索結果に割り当てる最大トークン数。デフォルトは環境設定に従います。
     """
     # 1. 内部パラメータの自動補完 (LLMに推論させず、システムでよしなに決定する)
-    file_extensions = []
+    file_extensions: list[str] = []
     context_lines = 3
     max_matches = 20
 
@@ -88,18 +95,24 @@ async def search_codebase(
         return f"【バリデーションエラー】\n引数が不正です。正規表現が複雑すぎるか、空のクエリです。\n詳細: {e}"
 
     if not is_safe_path(BASE_DIR, params.target_dir):
-        return "【アクセス拒否】\n無効なディレクトリパスが指定されました。対象ルート配下の有効な相対パスを指定してください。"
+        return (
+            "【アクセス拒否】\n"
+            "無効なディレクトリパスが指定されました。対象ルート配下の有効な相対パスを指定してください。"
+        )
 
     # 2. コアロジックの実行
     raw_result = await run_search(params, BASE_DIR)
-    
+
     # 3. マークダウンへのパースと返却
     md_result = format_to_markdown(raw_result)
-    
+
     # 動的なトークン予算による切り詰め
     if len(md_result) > dynamic_char_limit:
-        md_result = md_result[:dynamic_char_limit] + "\n\n[システム通知: トークン予算上限に達したため検索結果が途中で切り捨てられました]"
-        
+        md_result = (
+            md_result[:dynamic_char_limit]
+            + "\n\n[システム通知: トークン予算上限に達したため検索結果が途中で切り捨てられました]"
+        )
+
     return md_result
 
 if __name__ == "__main__":

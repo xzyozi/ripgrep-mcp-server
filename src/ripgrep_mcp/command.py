@@ -1,11 +1,12 @@
-import os
+import ast
+import asyncio
 import json
 import logging
-import asyncio
-import ast
-import time
+import os
 from pathlib import Path
+import time
 from typing import Any
+
 from .sanitizer import SearchParams
 
 logger = logging.getLogger(__name__)
@@ -81,12 +82,12 @@ class ScopeFinder(ast.NodeVisitor):
         self.generic_visit(node)
         self.current_path.pop()
 
-    def _record_scope(self, node: ast.AST) -> None:
+    def _record_scope(self, node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         start = node.lineno
         end = getattr(node, "end_lineno", start)
         if end is None:
             end = start
-        
+
         path = " -> ".join(self.current_path)
         for line in range(start, end + 1):
             # より深いネスト構造のスコープを優先して上書き
@@ -98,26 +99,26 @@ def find_python_scopes(file_path: Path, line_numbers: list[int]) -> str:
     """
     if not file_path.exists() or file_path.suffix != ".py":
         return ""
-        
+
     try:
         content = file_path.read_text(encoding="utf-8", errors="ignore")
         tree = ast.parse(content, filename=str(file_path))
         finder = ScopeFinder()
         finder.visit(tree)
-        
+
         matched_scopes = []
         for line in line_numbers:
             scope = finder.scopes.get(line)
             if scope and scope not in matched_scopes:
                 matched_scopes.append(scope)
-                
+
         if matched_scopes:
             return ", ".join(matched_scopes)
     except (SyntaxError, ValueError) as e:
         logger.debug(f"Failed to parse AST for {file_path}: {e}")
     except Exception as e:
         logger.warning(f"Unexpected error reading/parsing {file_path}: {e}")
-        
+
     return ""
 
 class FileMatch:
@@ -159,7 +160,7 @@ def build_rg_command(params: SearchParams, target_path: str) -> list[str]:
     for ext in params.file_extensions:
         clean_ext = ext.lstrip('.')
         cmd.extend(["-g", f"*.{clean_ext}"])
-        
+
     cmd.extend(["--", params.query, target_path])
     return cmd
 
@@ -177,7 +178,7 @@ async def execute_ripgrep(cmd: list[str], timeout: float = 3.0) -> tuple[int, st
             stderr=asyncio.subprocess.PIPE,
             env=env
         )
-        
+
         try:
             # wait_for を使用してタイムアウト制御しながら実行
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
@@ -198,7 +199,7 @@ async def execute_ripgrep(cmd: list[str], timeout: float = 3.0) -> tuple[int, st
                 pass
             await process.wait()
             return -1, "", "TIMEOUT"
-            
+
     except OSError as e:
         logger.error(f"ripgrep (rg) command execution failed: {e}")
         return -2, "", "RIPGREP_EXEC_ERROR"
@@ -211,7 +212,7 @@ def parse_ripgrep_output(stdout: str, base_dir: Path) -> tuple[list[dict[str, An
     ripgrepのJSONL出力をパースし、ファイルごとに行番号付きでコードスニペットをまとめる。
     """
     file_matches: dict[str, FileMatch] = {}
-    
+
     for line in stdout.splitlines():
         if not line.strip():
             continue
@@ -223,51 +224,51 @@ def parse_ripgrep_output(stdout: str, base_dir: Path) -> tuple[list[dict[str, An
                 raw_path = payload.get("path", {}).get("text", "")
                 if not raw_path:
                     continue
-                
+
                 try:
                     rel_path = str(Path(raw_path).relative_to(base_dir))
                 except ValueError:
                     rel_path = raw_path
-                
+
                 line_num = payload.get("line_number")
                 line_text = payload.get("lines", {}).get("text", "")
                 is_match = (dtype == "match")
-                
+
                 if rel_path not in file_matches:
                     file_matches[rel_path] = FileMatch(rel_path)
-                
+
                 file_matches[rel_path].add_line(line_num, line_text, is_match)
         except json.JSONDecodeError:
             continue
-            
+
     results = []
     total_chars = 0
     truncated = False
-    
+
     for rel_path, match in file_matches.items():
         snippet = match.get_snippet()
-        
+
         # ASTからスコープ情報を解決 (Pythonのみ)
         scope = ""
         if rel_path.endswith(".py"):
             abs_path = base_dir / rel_path
             scope = find_python_scopes(abs_path, sorted(list(match.match_lines)))
-            
+
         snippet_len = len(snippet) + len(rel_path) + len(scope) + 100
         if total_chars + snippet_len > MAX_RESPONSE_CHARS:
             truncated = True
             break
-        
+
         item = {
             "file": rel_path.replace("\\", "/"),  # Windowsパスの区切り文字を一貫してスラッシュに統一
             "code_snippet": snippet
         }
         if scope:
             item["scope"] = scope
-            
+
         results.append(item)
         total_chars += len(snippet) + len(scope)
-        
+
     return results, truncated
 
 def build_search_response(
@@ -319,7 +320,10 @@ def build_search_response(
                 "error": {
                     "code": "RIPGREP_EXEC_ERROR",
                     "message": "ripgrepの実行ファイルが見つからないか、実行権限がありません。",
-                    "suggestion": "システム環境にripgrepが正しくインストールされ、実行可能パスが通っていることを確認してください。",
+                    "suggestion": (
+                        "システム環境にripgrepが正しくインストールされ、"
+                        "実行可能パスが通っていることを確認してください。"
+                    ),
                     "ripgrep_error": stderr.strip() if stderr else None
                 }
             }
@@ -353,7 +357,7 @@ async def run_search(params: SearchParams, base_dir: Path) -> dict[str, Any]:
 
     resolved_base = base_dir.resolve()
     target_path_obj = (resolved_base / params.target_dir).resolve()
-    
+
     # セキュリティチェック: ターゲットがbase_dir配下にあることを確認 (多層防御)
     if not target_path_obj.is_relative_to(resolved_base):
         return {
@@ -367,9 +371,9 @@ async def run_search(params: SearchParams, base_dir: Path) -> dict[str, Any]:
         }
 
     cmd = build_rg_command(params, str(target_path_obj))
-    
+
     returncode, stdout, stderr = await execute_ripgrep(cmd)
-    
+
     response = build_search_response(returncode, stdout, stderr, params, base_dir)
 
     # 正常系レスポンスのみキャッシュに保存する
