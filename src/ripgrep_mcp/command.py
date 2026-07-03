@@ -60,8 +60,8 @@ search_cache = SearchCache(ttl=30.0)
 
 class ScopeFinder(ast.NodeVisitor):
     def __init__(self) -> None:
-        self.scopes: Dict[int, str] = {}  # line_number -> scope path string
-        self.current_path: List[str] = []
+        self.scopes: dict[int, str] = {}  # line_number -> scope path string
+        self.current_path: list[str] = []
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self.current_path.append(f"class {node.name}")
