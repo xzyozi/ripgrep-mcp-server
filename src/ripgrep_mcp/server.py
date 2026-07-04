@@ -2,10 +2,10 @@ import logging
 import os
 from pathlib import Path
 import sys
-from typing import Optional
-
+from typing import Annotated
 from mcp.server.fastmcp import FastMCP
-from pydantic import ValidationError
+from pydantic import Field, ValidationError
+
 
 from .command import run_search
 from .sanitizer import SearchParams, is_safe_path
@@ -63,16 +63,12 @@ def format_to_markdown(result_dict: dict) -> str:
     description="リポジトリ内のソースコードを正規表現で検索し、マッチした行と周辺のコンテキストを取得します。関数定義やクラスを調査するのに使用してください。"
 )
 async def search_codebase(
-    query: str,
-    target_dir: str,
-    token_budget: Optional[int] = None
+    query: Annotated[str, Field(description="検索キーワードまたはRust互換の正規表現（例: 'def my_function', 'class [A-Z]\\w+'）")],
+    target_dir: Annotated[str, Field(description="検索対象のディレクトリパス（相対パス）。リポジトリ全体を検索する場合は '.'")],
+    token_budget: Annotated[int, Field(description="今回の検索結果に割り当てる最大トークン数。デフォルト（8000字制限）を適用する場合は 0 を指定します。")] = 0
 ) -> str:
     """
     ソースコードを指定の正規表現クエリで検索します。
-
-    :param query: 検索キーワードまたはRust互換の正規表現。（例: 'def my_function', 'class [A-Z]\\w+'）
-    :param target_dir: 検索対象のディレクトリパス（相対パス）。リポジトリ全体を検索する場合は '.'
-    :param token_budget: (任意) 今回の検索結果に割り当てる最大トークン数。デフォルトは環境設定に従います。
     """
     # 1. 内部パラメータの自動補完 (LLMに推論させず、システムでよしなに決定する)
     file_extensions: list[str] = []
@@ -80,7 +76,7 @@ async def search_codebase(
     max_matches = 20
 
     # token_budget が指定された場合、それをベースに文字数上限を算出 (3文字 = 1トークン)
-    dynamic_char_limit = (token_budget * 3) if token_budget else 8000
+    dynamic_char_limit = (token_budget * 3) if token_budget > 0 else 8000
 
     try:
         params = SearchParams(
